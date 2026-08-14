@@ -1,0 +1,43 @@
+# ============================================
+# DeepSeek Harness 启动器 - .gitignore
+# 排除个人数据与敏感文件，仅保留可发布的源码
+# ============================================
+
+# ---- 用户数据（敏感：含 API 凭据、聊天记录，切勿发布）----
+userdata/
+home-clean/
+home/
+home-fresh/
+dsh-home/
+backups/
+config.json
+
+# ---- 程序与构建产物 ----
+*.exe
+bin/
+obj/
+
+# ---- 日志与诊断 ----
+*.log
+diag-*.log
+diag-*.txt
+
+# ---- 内置浏览器缓存（可重建）----
+webview-data/
+webview-data-v3/
+webview-data*/
+
+# ---- 下载 / 解压临时文件 ----
+dsh-source.zip
+dsh-extract/
+
+# ---- 启动画面图库（图片多为网上收集，存在版权风险，发布时排除）----
+pics/
+
+# ---- 开发过程工具残留 ----
+heal-links/
+who-locks/
+
+# ---- 系统文件 ----
+Thumbs.db
+Desktop.ini

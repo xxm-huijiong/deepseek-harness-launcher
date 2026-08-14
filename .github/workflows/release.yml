@@ -1,0 +1,52 @@
+name: Build and Release
+
+# 自动发版：推送 v* 标签（如 v1.0.0）时自动编译并发布两个版本 exe；
+# 也可在 Actions 页面手动触发（Run workflow）。
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET 7
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "7.0.x"
+
+      # 1) 框架依赖版（小体积，需已安装 .NET 7 Desktop Runtime）
+      - name: Build (framework-dependent)
+        run: dotnet publish -c Release -r win-x64 --self-contained false -p:PublishSingleFile=true
+
+      - name: Rename framework-dependent exe
+        shell: pwsh
+        run: |
+          Move-Item bin\Release\net7.0-windows\win-x64\publish\DshLauncher.exe `
+            "DeepSeek-Harness-${{ github.ref_name }}.exe"
+
+      # 2) 自包含版（大体积，无需安装 .NET Runtime）
+      - name: Build (self-contained)
+        run: dotnet publish -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true
+
+      - name: Rename self-contained exe
+        shell: pwsh
+        run: |
+          Move-Item bin\Release\net7.0-windows\win-x64\publish\DshLauncher.exe `
+            "DeepSeek-Harness-${{ github.ref_name }}-self-contained.exe"
+
+      # 3) 发布到 GitHub Releases（自动生成变更说明）
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            DeepSeek-Harness-*.exe
+          generate_release_notes: true
