@@ -20,7 +20,7 @@
 ```
 https://github.com/xxm-huijiong/deepseek-harness-launcher/releases
 ```
-下载 `DeepSeek Harness.exe`（框架依赖版，1.6MB）或自包含版（无需 .NET Runtime）。
+下载 `dsh-launcher.exe`（框架依赖版，1.6MB）或自包含版（无需 .NET Runtime）。
 运行前先确认已满足「环境要求」（.NET 7 Desktop Runtime / WebView2 / Node.js / pnpm）。
 
 **方式二：从源码自行编译**
@@ -42,7 +42,7 @@ https://github.com/xxm-huijiong/deepseek-harness-launcher/releases
 
 **第二步：打开启动器**
 
-双击 `DeepSeek Harness.exe`。若本机还没有 dsh 源码，会弹出引导：
+双击 `dsh-launcher.exe`。若本机还没有 dsh 源码，会弹出引导：
 
 1. **【是】自动下载安装** —— 从 GitHub 下载 dsh 源码，自动解压并安装依赖（会询问使用**国内镜像**还是直连）
 2. **【否】手动选择目录** —— 如果你已手动下载/解压了 dsh 源码，选择那个目录即可
@@ -86,12 +86,12 @@ pnpm dsh web
 | .NET 7 SDK | 下载：https://dotnet.microsoft.com/download/dotnet/7.0 （含编译与运行所需） |
 | 验证 | 命令行执行 `dotnet --version`，能输出版本号即可 |
 
-**一键编译**：源码目录下有 `build.bat`，双击运行即可，产物直接输出为源码根目录下的 `DeepSeek Harness.exe`：
+**一键编译**：源码目录下有 `build.bat`，双击运行即可，产物直接输出为源码根目录下的 `dsh-launcher.exe`：
 
 ```bat
 :: build.bat 内容（等价于手动执行）：
 dotnet publish -c Release -r win-x64 --self-contained false -p:PublishSingleFile=true
-:: 产物复制：bin\Release\net7.0-windows\win-x64\publish\DshLauncher.exe → DeepSeek Harness.exe
+:: 产物复制：bin\Release\net7.0-windows\win-x64\publish\DshLauncher.exe → dsh-launcher.exe
 ```
 
 **手动命令**：
@@ -110,7 +110,7 @@ dotnet publish -c Release -r win-x64 --self-contained false -p:PublishSingleFile
 
 ```
 <启动器目录>\                    ← 启动器所在文件夹（可放任意盘）
-├─ DeepSeek Harness.exe          ← 启动器主程序
+├─ dsh-launcher.exe          ← 启动器主程序
 ├─ config.json                   ← 配置（workDir = dsh 源码目录）
 ├─ userdata\                     ← ★ 用户数据（最重要）
 │  ├─ sessions\                  ← 聊天记录

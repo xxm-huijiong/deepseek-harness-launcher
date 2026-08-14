@@ -24,9 +24,9 @@ if errorlevel 1 (
     exit /b 1
 )
 
-copy /y "bin\Release\net7.0-windows\win-x64\publish\DshLauncher.exe" "%~dp0DeepSeek Harness.exe" >nul
+copy /y "bin\Release\net7.0-windows\win-x64\publish\DshLauncher.exe" "%~dp0dsh-launcher.exe" >nul
 if errorlevel 1 (
-    echo [提示] 复制产物到根目录失败（可能 DeepSeek Harness.exe 正被占用，请先关闭运行中的启动器）。
+    echo [提示] 复制产物到根目录失败（可能 dsh-launcher.exe 正被占用，请先关闭运行中的启动器）。
     pause
     exit /b 1
 )
@@ -34,6 +34,6 @@ if errorlevel 1 (
 echo.
 echo ============================================
 echo   编译完成！
-echo   产物：%~dp0DeepSeek Harness.exe
+echo   产物：%~dp0dsh-launcher.exe
 echo ============================================
 pause

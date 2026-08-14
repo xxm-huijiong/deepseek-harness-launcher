@@ -31,7 +31,7 @@ jobs:
         shell: pwsh
         run: |
           Move-Item bin\Release\net7.0-windows\win-x64\publish\DshLauncher.exe `
-            "DeepSeek-Harness-${{ github.ref_name }}.exe"
+            "dsh-launcher-${{ github.ref_name }}.exe"
 
       # 2) 自包含版（大体积，无需安装 .NET Runtime）
       - name: Build (self-contained)
@@ -41,12 +41,12 @@ jobs:
         shell: pwsh
         run: |
           Move-Item bin\Release\net7.0-windows\win-x64\publish\DshLauncher.exe `
-            "DeepSeek-Harness-${{ github.ref_name }}-self-contained.exe"
+            "dsh-launcher-${{ github.ref_name }}-self-contained.exe"
 
       # 3) 发布到 GitHub Releases（自动生成变更说明）
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            DeepSeek-Harness-*.exe
+            dsh-launcher-*.exe
           generate_release_notes: true

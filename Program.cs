@@ -98,7 +98,7 @@ namespace DshLauncher
 
         public MainForm()
         {
-            Text = "DeepSeek Harness";
+            Text = "dsh-launcher";
             try { Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); } catch { }
             Font = new Font("Microsoft YaHei UI", 9.5f);
             ClientSize = new Size(1100, 720);
@@ -120,7 +120,7 @@ namespace DshLauncher
             {
                 Icon = Icon,
                 Visible = true,
-                Text = "DeepSeek Harness"
+                Text = "dsh-launcher"
             };
             var trayMenu = new ContextMenuStrip();
             trayMenu.Items.Add("显示主窗口", null, (s, e) => ShowMainWindow());
@@ -369,7 +369,7 @@ namespace DshLauncher
                 if (!_trayNotified)
                 {
                     _trayNotified = true;
-                    _trayIcon.ShowBalloonTip(2500, "DeepSeek Harness",
+                    _trayIcon.ShowBalloonTip(2500, "dsh-launcher",
                         "已最小化到系统托盘，服务仍在后台运行。\n右键托盘图标可退出。",
                         ToolTipIcon.Info);
                 }
@@ -649,7 +649,7 @@ namespace DshLauncher
                 _statusLabel.ForeColor = Color.FromArgb(120, 120, 120);
                 _uiLoaded = false;
             }
-            try { _trayIcon.Text = "DeepSeek Harness - " + _statusLabel.Text.Replace("● ", ""); } catch { }
+            try { _trayIcon.Text = "dsh-launcher - " + _statusLabel.Text.Replace("● ", ""); } catch { }
             try
             {
                 if (!IsDisposed)
@@ -778,7 +778,7 @@ namespace DshLauncher
         private async Task RunInstallFlowAsync()
         {
             var choice = MessageBox.Show(
-                "未找到 DeepSeek Harness 源码（" + WorkDir + "）。\n\n" +
+                "未找到 dsh-launcher 源码（" + WorkDir + "）。\n\n" +
                 "【是】自动下载安装（国内网络可用镜像加速）\n" +
                 "【否】手动选择已解压的源码目录\n" +
                 "【取消】退出",
@@ -792,7 +792,7 @@ namespace DshLauncher
             {
                 using var dlg = new FolderBrowserDialog
                 {
-                    Description = "请选择 DeepSeek Harness 源码目录（需包含 package.json）",
+                    Description = "请选择 dsh-launcher 源码目录（需包含 package.json）",
                     UseDescriptionForTitle = true
                 };
                 if (dlg.ShowDialog(this) == DialogResult.OK && Directory.Exists(dlg.SelectedPath))
