@@ -16,6 +16,7 @@ config.json
 *.exe
 bin/
 obj/
+history/
 
 # ---- 日志与诊断 ----
 *.log

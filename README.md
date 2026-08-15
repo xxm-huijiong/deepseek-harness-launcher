@@ -20,7 +20,7 @@
 ```
 https://github.com/xxm-huijiong/deepseek-harness-launcher/releases
 ```
-下载 `dsh-launcher.exe`（框架依赖版，1.6MB）或自包含版（无需 .NET Runtime）。
+下载 `dsh-launcher.exe`（框架依赖版，约 1.6MB）。
 运行前先确认已满足「环境要求」（.NET 7 Desktop Runtime / WebView2 / Node.js / pnpm）。
 
 **方式二：从源码自行编译**

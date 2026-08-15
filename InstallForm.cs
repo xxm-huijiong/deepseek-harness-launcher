@@ -170,21 +170,50 @@ namespace DshLauncher
                             "安装失败", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                         return;
                     }
-                    SetStep("pnpm 安装完成", 20);
+                    SetStep("pnpm 安装完成，重新检测 ...", 20);
+                    if (MainForm.FindPnpm() == null)
+                    {
+                        Log("安装后仍未检测到 pnpm（PATH 未刷新），需要重启启动器。");
+                        MessageBox.Show(
+                            "pnpm 已安装成功，但当前进程暂时无法识别（Windows PATH 需重启生效）。\n\n" +
+                            "请关闭本窗口，重新打开启动器后再继续。",
+                            "需要重启启动器", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                        return;
+                    }
+                    Log("已检测到 pnpm。");
                 }
 
-                // 3) 下载源码
-                string url = _rbMirror.Checked ? MainForm.SourceZipMirror : MainForm.SourceZipDirect;
-                SetStep("下载 dsh 源码 ...", 25);
+                // 3) 下载源码（镜像候选按顺序尝试，失败自动切换；最后一项为直连）
+                string[] urls = _rbMirror.Checked ? MainForm.SourceZipMirrors : new[] { MainForm.SourceZipDirect };
                 string zipPath = Path.Combine(MainForm.LauncherDir, "dsh-source.zip");
-                Log("下载：" + url);
-                using (var client = new HttpClient { Timeout = TimeSpan.FromMinutes(15) })
-                using (var fs = new FileStream(zipPath, FileMode.Create, FileAccess.Write, FileShare.None))
+                bool downloaded = false;
+                foreach (var url in urls)
                 {
-                    var resp = await client.GetAsync(url, HttpCompletionOption.ResponseHeadersRead);
-                    resp.EnsureSuccessStatusCode();
-                    await resp.Content.CopyToAsync(fs);
+                    SetStep("下载 dsh 源码 ...", 25);
+                    Log("下载：" + url);
+                    try
+                    {
+                        using (var client = new HttpClient { Timeout = TimeSpan.FromMinutes(15) })
+                        using (var fs = new FileStream(zipPath, FileMode.Create, FileAccess.Write, FileShare.None))
+                        {
+                            var resp = await client.GetAsync(url, HttpCompletionOption.ResponseHeadersRead);
+                            if (!resp.IsSuccessStatusCode)
+                            {
+                                Log("下载失败（HTTP " + (int)resp.StatusCode + "），尝试下一个源 ...");
+                                continue;
+                            }
+                            await resp.Content.CopyToAsync(fs);
+                        }
+                        downloaded = true;
+                        break;
+                    }
+                    catch (Exception ex)
+                    {
+                        Log("下载异常：" + ex.Message + "，尝试下一个源 ...");
+                    }
                 }
+                if (!downloaded)
+                    throw new Exception("所有下载源均失败（网络不可达或地址无效），请稍后重试或更换网络。");
                 SetStep("下载完成，正在解压 ...", 50);
                 Log("下载完成：" + new FileInfo(zipPath).Length / 1024 / 1024 + " MB");
 
@@ -200,11 +229,25 @@ namespace DshLauncher
                 SetStep("源码就绪，安装依赖（pnpm install，可能需要几分钟）...", 60);
 
                 // 4) 安装依赖
-                bool ok = await RunProcessAsync(_node, "\"" + MainForm.FindPnpm() + "\" install", MainForm.WorkDir, 1800);
+                string pnpm = MainForm.FindPnpm();
+                bool ok = await RunProcessAsync(_node, "\"" + pnpm + "\" install", MainForm.WorkDir, 1800);
                 if (!ok)
                 {
                     MessageBox.Show("依赖安装失败，请手动在 " + MainForm.WorkDir + " 执行 pnpm install。",
                         "安装失败", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    return;
+                }
+
+                // 5) 构建（官方流程 pnpm run build：生成 web 前端产物 lib/dist，缺失会导致 MissingClientBundleError）
+                SetStep("构建前端产物（pnpm run build，可能需要几分钟）...", 80);
+                Log("开始构建（pnpm run build）...");
+                bool built = await RunProcessAsync(_node, "\"" + pnpm + "\" run build", MainForm.WorkDir, 1800);
+                if (!built)
+                {
+                    MessageBox.Show(
+                        "构建失败（pnpm run build），服务可能无法启动。\n" +
+                        "可稍后手动在 " + MainForm.WorkDir + " 执行 pnpm run build。",
+                        "构建失败", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                     return;
                 }
 
@@ -217,7 +260,7 @@ namespace DshLauncher
             catch (Exception ex)
             {
                 Log("安装失败：" + ex.Message);
-                MessageBox.Show("自动安装失败：" + ex.Message + "\n\n可尝试：\n1. 切换下载方式重试\n2. 手动从 " + MainForm.SourceRepoUrl + " 下载后选择已有目录",
+                MessageBox.Show("自动安装失败：" + ex.Message + "\n\n可尝试：\n1. 点击「开始安装」重试（会自动切换下载源）\n2. 手动从 " + MainForm.SourceRepoUrl + " 下载后选择已有目录",
                     "安装失败", MessageBoxButtons.OK, MessageBoxIcon.Warning);
             }
             finally

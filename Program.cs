@@ -34,6 +34,18 @@ namespace DshLauncher
                 MainForm.LoadConfig();              // 安装/选择目录可能改写 workDir
             }
 
+            // 启动时检查更新（前置更新窗口）：检测到新版才弹窗
+            if (MainForm.CheckUpdateOnStart)
+            {
+                string remote = Task.Run(MainForm.CheckVersionRemote).GetAwaiter().GetResult();
+                if (remote != null && remote != "latest")
+                {
+                    using var updater = new UpdateForm(MainForm.LocalVersion, remote);
+                    Application.Run(updater);
+                    // 更新成功后直接进入主界面（新版源码已就绪）
+                }
+            }
+
             Application.Run(new MainForm());
         }
     }
@@ -49,8 +61,13 @@ namespace DshLauncher
         internal static readonly string LogFile = Path.Combine(LauncherDir, "launcher.log");
         private static readonly string WebViewDataDir = Path.Combine(LauncherDir, "webview-data-v3");
         internal const string SourceRepoUrl = @"https://github.com/deepseek-ai/deepseek-harness";                    // dsh 官方仓库
-        internal const string SourceZipDirect = @"https://github.com/deepseek-ai/deepseek-harness/archive/refs/heads/main.zip";          // 直连下载
-        internal const string SourceZipMirror = @"https://ghproxy.net/https://github.com/deepseek-ai/deepseek-harness/archive/refs/heads/main.zip";  // 国内镜像下载
+        internal const string SourceZipDirect = @"https://github.com/deepseek-ai/deepseek-harness/archive/refs/heads/master.zip";          // 直连下载（官方默认分支为 master）
+        internal const string SourceZipMirror = @"https://ghproxy.net/https://github.com/deepseek-ai/deepseek-harness/archive/refs/heads/master.zip";  // 国内镜像下载
+        internal static readonly string[] SourceZipMirrors = {                          // 镜像候选（按顺序尝试，失败自动切换）
+            @"https://ghproxy.net/https://github.com/deepseek-ai/deepseek-harness/archive/refs/heads/master.zip",
+            @"https://gh-proxy.com/https://github.com/deepseek-ai/deepseek-harness/archive/refs/heads/master.zip",
+            SourceZipDirect
+        };
 
         private const int Port = 3080;
         private const string UiUrl = @"http://127.0.0.1:3080/web/";
@@ -83,6 +100,14 @@ namespace DshLauncher
         private Button _btnCheck;            // 检查更新
         private CheckBox _chkAutoStart;
         private CheckBox _chkAutoCheck;      // 启动时检查更新
+        private CheckBox _chkNotify;         // 任务提醒（等待确认/任务完成时气泡+提示音）
+
+        // 事件监听（events.mux）：检测「需要审批」与「任务完成」
+        private System.Net.WebSockets.ClientWebSocket _eventWs;
+        private System.Threading.CancellationTokenSource _eventCts;
+        private readonly Dictionary<string, string> _jobStates = new();    // jobId → status
+        private readonly HashSet<string> _notifiedApprovals = new();       // approvalId 去重
+        private bool _eventMonitorStarted;
 
         private Panel _logPanel;             // 底部日志面板（默认收起）
         private TextBox _logBox;
@@ -205,6 +230,15 @@ namespace DshLauncher
                 Text = "启动时检查更新",
                 Location = new Point(734, 13),
                 Size = new Size(150, 22),
+                Checked = CheckUpdateOnStart,
+                Font = new Font(Font.FontFamily, 9f)
+            });
+            _chkAutoCheck.CheckedChanged += (s, e) => { CheckUpdateOnStart = _chkAutoCheck.Checked; SaveConfig(); };
+            _actionsPanel.Controls.Add(_chkNotify = new CheckBox
+            {
+                Text = "任务提醒",
+                Location = new Point(892, 13),
+                Size = new Size(100, 22),
                 Checked = true,
                 Font = new Font(Font.FontFamily, 9f)
             });
@@ -354,9 +388,7 @@ namespace DshLauncher
             if (_chkAutoStart.Checked)
                 _ = StartServerAsync();
 
-            // 启动时检查更新（静默模式：有更新才提示）
-            if (_chkAutoCheck.Checked)
-                _ = CheckForUpdatesAsync(interactive: false);
+            // 启动时检查更新已移至主程序入口（前置更新窗口）处理
         }
 
         private void OnFormClosing(object sender, FormClosingEventArgs e)
@@ -492,6 +524,7 @@ namespace DshLauncher
                     {
                         Log("服务已就绪。");
                         LoadUi();
+                        StartEventMonitor();   // 监听审批/任务事件（任务提醒）
                     }
                     else
                     {
@@ -513,6 +546,7 @@ namespace DshLauncher
 
         private void StopServer()
         {
+            StopEventMonitor();   // 服务停止，事件监听一并停止
             var p = _managedServer;
             _managedServer = null;
             if (p != null)
@@ -639,6 +673,7 @@ namespace DshLauncher
             {
                 _statusLabel.Text = "● 运行中  http://127.0.0.1:" + Port + "/web/";
                 _statusLabel.ForeColor = Color.FromArgb(0, 140, 0);
+                StartEventMonitor();   // 任务提醒（含外部实例就绪的场景）
             }
             else if (hasServer)
             {
@@ -730,6 +765,8 @@ namespace DshLauncher
         }
 
         // ── 配置与首次安装引导 ────────────────────────────────────
+        internal static bool CheckUpdateOnStart = true;   // 启动时检查更新（config.json 持久化）
+
         internal static void LoadConfig()
         {
             try
@@ -743,15 +780,17 @@ namespace DshLauncher
                         if (!string.IsNullOrEmpty(v) && Directory.Exists(v))
                         {
                             WorkDir = v;
-                            return;
                         }
                     }
+                    if (doc.RootElement.TryGetProperty("checkUpdate", out var cu) && cu.ValueKind == JsonValueKind.False)
+                        CheckUpdateOnStart = false;
                 }
             }
             catch { }
 
-            // 无有效配置时回退到启动器目录下的默认位置（dsh-src）；不存在则首次引导让用户选择/下载
-            WorkDir = Path.Combine(LauncherDir, "dsh-src");
+            // 无有效 workDir 时回退到启动器目录下的默认位置（dsh-src）；不存在则首次引导让用户选择/下载
+            if (!HasDshSourceAt(WorkDir))
+                WorkDir = Path.Combine(LauncherDir, "dsh-src");
         }
 
         internal static bool HasDshSourceAt(string dir)
@@ -766,7 +805,7 @@ namespace DshLauncher
             try
             {
                 File.WriteAllText(ConfigFile,
-                    JsonSerializer.Serialize(new { workDir = WorkDir }, new JsonSerializerOptions { WriteIndented = true }));
+                    JsonSerializer.Serialize(new { workDir = WorkDir, checkUpdate = CheckUpdateOnStart }, new JsonSerializerOptions { WriteIndented = true }));
             }
             catch { }
         }
@@ -884,7 +923,11 @@ namespace DshLauncher
                 string candidate = Path.Combine(Path.GetDirectoryName(dir), "node_modules", "pnpm", "bin", "pnpm.cjs");
                 if (File.Exists(candidate)) return candidate;
             }
-            // 2) 本机已知路径回退
+            // 2) npm 默认全局目录（%APPDATA%\npm；刚用 npm -g 安装、PATH 未刷新时也能找到）
+            string npmGlobal = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "npm");
+            string candidate2 = Path.Combine(npmGlobal, "node_modules", "pnpm", "bin", "pnpm.cjs");
+            if (File.Exists(candidate2)) return candidate2;
+            // 3) 本机已知路径回退
             if (File.Exists(PnpmCjs)) return PnpmCjs;
             return null;
         }
@@ -910,7 +953,7 @@ namespace DshLauncher
             return (null, null);
         }
 
-        private static string ResolveFromPath(string name)
+        internal static string ResolveFromPath(string name)
         {
             try
             {
@@ -1053,9 +1096,26 @@ namespace DshLauncher
             Log("发现新版本：" + result + "（本地 " + LocalVersion + "）");
             var r = MessageBox.Show(
                 "发现新版本 " + result + "（本地 " + LocalVersion + "）。\n\n" +
-                "是否打开 GitHub 仓库查看更新说明并下载最新源码？",
-                "发现更新", MessageBoxButtons.YesNo, MessageBoxIcon.Information);
+                "【是】立即自动更新（停服 → 更新源码 → 重装依赖并构建 → 重启服务）\n" +
+                "【否】只打开 GitHub 仓库手动处理",
+                "发现更新", MessageBoxButtons.YesNoCancel, MessageBoxIcon.Information);
+            if (r == DialogResult.Cancel) return;
             if (r == DialogResult.Yes)
+            {
+                // 自动更新：先停服务，避免源码被占用
+                StopEventMonitor();
+                bool wasRunning = _managedServer != null && !_managedServer.HasExited;
+                if (wasRunning) StopServer();
+                using var updater = new UpdateForm(LocalVersion, result);
+                updater.ShowDialog(this);
+                if (updater.Completed && wasRunning)
+                {
+                    Log("更新完成，正在重启服务 ...");
+                    _ = StartServerAsync();
+                }
+                return;
+            }
+            if (r == DialogResult.No)
             {
                 try
                 {
@@ -1073,7 +1133,7 @@ namespace DshLauncher
             _ = CheckForUpdatesAsync(interactive);
         }
 
-        private static string LocalVersion
+        internal static string LocalVersion
         {
             get
             {
@@ -1090,12 +1150,125 @@ namespace DshLauncher
             }
         }
 
+        // ── 事件监听（任务提醒：等待确认 / 任务完成） ──────────────
+        private void StartEventMonitor()
+        {
+            if (_eventMonitorStarted || _eventCts != null) return;
+            _eventCts = new System.Threading.CancellationTokenSource();
+            _eventMonitorStarted = true;
+            _ = Task.Run(() => EventMonitorLoopAsync(_eventCts.Token));
+        }
+
+        private void StopEventMonitor()
+        {
+            _eventMonitorStarted = false;
+            try { _eventCts?.Cancel(); } catch { }
+            try { _eventCts?.Dispose(); } catch { }
+            _eventCts = null;
+            try { _eventWs?.Dispose(); } catch { }
+            _eventWs = null;
+        }
+
+        private async Task EventMonitorLoopAsync(System.Threading.CancellationToken ct)
+        {
+            while (!ct.IsCancellationRequested)
+            {
+                try
+                {
+                    using var ws = new System.Net.WebSockets.ClientWebSocket();
+                    _eventWs = ws;
+                    await ws.ConnectAsync(new Uri("ws://127.0.0.1:" + Port + "/api/events.mux"), ct);
+                    Log("事件监听已连接（任务提醒就绪）。");
+                    var buf = new byte[65536];
+                    while (ws.State == System.Net.WebSockets.WebSocketState.Open && !ct.IsCancellationRequested)
+                    {
+                        var result = await ws.ReceiveAsync(new ArraySegment<byte>(buf), ct);
+                        if (result.MessageType == System.Net.WebSockets.WebSocketMessageType.Close) break;
+                        string text = System.Text.Encoding.UTF8.GetString(buf, 0, result.Count);
+                        ProcessEvent(text);
+                    }
+                }
+                catch (OperationCanceledException) { break; }
+                catch (Exception ex)
+                {
+                    Log("事件监听断开（" + ex.GetType().Name + "），5 秒后重连。");
+                }
+                try { await Task.Delay(5000, ct); } catch { break; }
+            }
+        }
+
+        private void ProcessEvent(string text)
+        {
+            try
+            {
+                using var doc = JsonDocument.Parse(text);
+                var root = doc.RootElement;
+                if (!root.TryGetProperty("method", out var m)) return;
+                string method = m.GetString();
+                if (!root.TryGetProperty("payload", out var payload)) return;
+
+                if (method == "approval/requested")
+                {
+                    // 需要用户确认：气泡 + 提示音（approvalId 去重）
+                    string id = payload.TryGetProperty("approvalId", out var a) ? a.GetString() : "";
+                    if (!string.IsNullOrEmpty(id) && !_notifiedApprovals.Add(id)) return;
+                    if (_notifiedApprovals.Count > 200) _notifiedApprovals.Clear();
+                    string tool = payload.TryGetProperty("toolName", out var t) ? t.GetString() : "?";
+                    string reason = payload.TryGetProperty("reason", out var r) ? r.GetString() : "";
+                    Notify("需要你的确认", "工具：" + tool + "\n" + Shorten(reason, 80));
+                }
+                else if (method == "session/jobs")
+                {
+                    // 任务状态快照：检测 running → completed/failed 转变
+                    if (!payload.TryGetProperty("jobs", out var jobs) || jobs.ValueKind != JsonValueKind.Array) return;
+                    foreach (var job in jobs.EnumerateArray())
+                    {
+                        string id = job.TryGetProperty("id", out var j) ? j.GetString() : "";
+                        string status = job.TryGetProperty("status", out var s) ? s.GetString() : "";
+                        if (string.IsNullOrEmpty(id) || string.IsNullOrEmpty(status)) continue;
+                        if (_jobStates.TryGetValue(id, out string prev) && prev != status
+                            && (prev == "running" || prev == "queued" || prev == "starting")
+                            && (status == "completed" || status == "failed" || status == "canceled"))
+                        {
+                            string label = job.TryGetProperty("label", out var l)
+                                ? Shorten(l.GetString(), 60) : id;
+                            Notify(status == "completed" ? "任务已完成" : "任务" + status, label);
+                        }
+                        _jobStates[id] = status;
+                    }
+                }
+            }
+            catch { }
+        }
+
+        private static string Shorten(string s, int max)
+        {
+            if (string.IsNullOrEmpty(s)) return "";
+            s = s.Replace("\r", " ").Replace("\n", " ");
+            return s.Length <= max ? s : s.Substring(0, max) + "...";
+        }
+
+        private void Notify(string title, string text)
+        {
+            try
+            {
+                if (!IsDisposed)
+                    Invoke((Action)(() =>
+                    {
+                        if (!_chkNotify.Checked) return;
+                        try { System.Media.SystemSounds.Exclamation.Play(); } catch { }
+                        try { _trayIcon.ShowBalloonTip(5000, "dsh-launcher - " + title, text, ToolTipIcon.Info); } catch { }
+                    }));
+            }
+            catch { }
+        }
+
         /// <summary>
         /// 返回 "latest" 表示无更新；返回版本号表示远程新版本；null 表示检查失败。
         /// 多候选源依次尝试：raw GitHub → ghproxy 镜像 → npm registry → 国内 npm 镜像；
         /// 自动读取 HTTPS_PROXY/HTTP_PROXY 环境变量（兼容代理环境，不影响系统设置）。
         /// </summary>
-        private static string CheckVersionRemote()
+        internal static string CheckVersionRemote()
         {
             var candidates = new[]
             {
