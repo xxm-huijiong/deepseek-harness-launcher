@@ -24,6 +24,16 @@ namespace DshLauncher
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
             MainForm.LoadConfig();   // 读取 config.json（可重定向 dsh 源码目录）
+
+            // 首次使用：先跑安装向导，环境与源码就绪后才进入主界面
+            if (!MainForm.HasDshSource())
+            {
+                using var installer = new InstallForm();
+                Application.Run(installer);
+                if (!installer.Completed) return;   // 用户取消 → 退出
+                MainForm.LoadConfig();              // 安装/选择目录可能改写 workDir
+            }
+
             Application.Run(new MainForm());
         }
     }
@@ -31,16 +41,16 @@ namespace DshLauncher
     internal class MainForm : Form
     {
         // ── 路径配置（以启动器所在目录为根，随 exe 位置，放任意盘/目录均可） ──
-        private static readonly string LauncherDir = Path.GetDirectoryName(Environment.ProcessPath) ?? @"D:\dsh-launcher";
-        private static string WorkDir = Path.Combine(LauncherDir, "dsh-src");          // dsh 源码目录（可由 config.json 的 workDir 重定向）
+        internal static readonly string LauncherDir = Path.GetDirectoryName(Environment.ProcessPath) ?? @"D:\dsh-launcher";
+        internal static string WorkDir = Path.Combine(LauncherDir, "dsh-src");          // dsh 源码目录（可由 config.json 的 workDir 重定向）
         private static readonly string ConfigFile = Path.Combine(LauncherDir, "config.json");
         private static readonly string DshHomeDir = Path.Combine(LauncherDir, "userdata");
         private const string LegacyHomeDir = @"C:\Users\wujiong\.dsh";                 // 旧版默认 home（仅本机迁移用，其他机器无此目录会自动跳过）
-        private static readonly string LogFile = Path.Combine(LauncherDir, "launcher.log");
+        internal static readonly string LogFile = Path.Combine(LauncherDir, "launcher.log");
         private static readonly string WebViewDataDir = Path.Combine(LauncherDir, "webview-data-v3");
-        private const string SourceRepoUrl = @"https://github.com/deepseek-ai/deepseek-harness";                    // dsh 官方仓库
-        private const string SourceZipDirect = @"https://github.com/deepseek-ai/deepseek-harness/archive/refs/heads/main.zip";          // 直连下载
-        private const string SourceZipMirror = @"https://ghproxy.net/https://github.com/deepseek-ai/deepseek-harness/archive/refs/heads/main.zip";  // 国内镜像下载
+        internal const string SourceRepoUrl = @"https://github.com/deepseek-ai/deepseek-harness";                    // dsh 官方仓库
+        internal const string SourceZipDirect = @"https://github.com/deepseek-ai/deepseek-harness/archive/refs/heads/main.zip";          // 直连下载
+        internal const string SourceZipMirror = @"https://ghproxy.net/https://github.com/deepseek-ai/deepseek-harness/archive/refs/heads/main.zip";  // 国内镜像下载
 
         private const int Port = 3080;
         private const string UiUrl = @"http://127.0.0.1:3080/web/";
@@ -339,14 +349,6 @@ namespace DshLauncher
             {
                 Diagnose("OnShown: 内置浏览器初始化失败 - " + ex.GetType().Name + ": " + ex.Message + "\n" + ex.StackTrace);
                 Log("内置浏览器初始化失败（需安装 WebView2 Runtime）：" + ex.Message);
-            }
-
-            if (!HasDshSource())
-            {
-                // 首次使用：进入安装引导（自动下载 / 手动选择目录）
-                Log("未找到 dsh 源码（" + WorkDir + "），进入首次安装引导 ...");
-                await RunInstallFlowAsync();
-                return;
             }
 
             if (_chkAutoStart.Checked)
@@ -752,14 +754,14 @@ namespace DshLauncher
             WorkDir = Path.Combine(LauncherDir, "dsh-src");
         }
 
-        private static bool HasDshSourceAt(string dir)
+        internal static bool HasDshSourceAt(string dir)
         {
             return Directory.Exists(dir)
                 && File.Exists(Path.Combine(dir, "package.json"))
                 && Directory.Exists(Path.Combine(dir, "apps", "cli"));
         }
 
-        private static void SaveConfig()
+        internal static void SaveConfig()
         {
             try
             {
@@ -769,134 +771,9 @@ namespace DshLauncher
             catch { }
         }
 
-        private static bool HasDshSource()
+        internal static bool HasDshSource()
         {
             return HasDshSourceAt(WorkDir);
-        }
-
-        /// <summary>首次安装引导：自动下载 / 手动选择源码目录。</summary>
-        private async Task RunInstallFlowAsync()
-        {
-            var choice = MessageBox.Show(
-                "未找到 dsh-launcher 源码（" + WorkDir + "）。\n\n" +
-                "【是】自动下载安装（国内网络可用镜像加速）\n" +
-                "【否】手动选择已解压的源码目录\n" +
-                "【取消】退出",
-                "首次使用",
-                MessageBoxButtons.YesNoCancel,
-                MessageBoxIcon.Question);
-
-            if (choice == DialogResult.Cancel) { Close(); return; }
-
-            if (choice == DialogResult.No)
-            {
-                using var dlg = new FolderBrowserDialog
-                {
-                    Description = "请选择 dsh-launcher 源码目录（需包含 package.json）",
-                    UseDescriptionForTitle = true
-                };
-                if (dlg.ShowDialog(this) == DialogResult.OK && Directory.Exists(dlg.SelectedPath))
-                {
-                    if (File.Exists(Path.Combine(dlg.SelectedPath, "package.json")))
-                    {
-                        WorkDir = dlg.SelectedPath;
-                        SaveConfig();
-                        Log("已选择源码目录：" + WorkDir);
-                        await StartServerAsync();
-                        return;
-                    }
-                    Log("所选目录不含 package.json，请选择 dsh 源码目录。");
-                    MessageBox.Show("所选目录不是有效的 dsh 源码目录（缺少 package.json）。",
-                        "目录无效", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-                }
-                return;
-            }
-
-            // 自动下载
-            await DownloadAndInstallAsync();
-        }
-
-        private async Task DownloadAndInstallAsync()
-        {
-            string node = FindNode();
-            if (node == null)
-            {
-                var r = MessageBox.Show(
-                    "未找到 Node.js（≥ v22.19），自动安装需要 Node.js 来安装依赖。\n" +
-                    "是否打开 Node.js 官网下载？",
-                    "缺少 Node.js", MessageBoxButtons.YesNo, MessageBoxIcon.Warning);
-                if (r == DialogResult.Yes)
-                {
-                    try { Process.Start(new ProcessStartInfo("https://nodejs.org") { UseShellExecute = true }); } catch { }
-                }
-                return;
-            }
-            if (FindPnpm() == null)
-            {
-                var r = MessageBox.Show(
-                    "未找到 pnpm。\n是否现在用 npm 自动安装 pnpm？（npm install -g pnpm）",
-                    "缺少 pnpm", MessageBoxButtons.YesNo, MessageBoxIcon.Question);
-                if (r != DialogResult.Yes) return;
-                Log("正在安装 pnpm ...");
-                string npm = ResolveFromPath("npm.cmd") ?? "npm";
-                if (!await RunProcessAsync(npm, "install -g pnpm", null, 300))
-                {
-                    MessageBox.Show("pnpm 安装失败，请手动执行 npm install -g pnpm 后重试。",
-                        "安装失败", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-                    return;
-                }
-            }
-
-            var mirror = MessageBox.Show(
-                "使用哪种方式下载源码？\n\n" +
-                "【是】国内镜像（ghproxy，推荐国内网络）\n" +
-                "【否】直连 GitHub",
-                "下载方式", MessageBoxButtons.YesNo, MessageBoxIcon.Question);
-            string url = mirror == DialogResult.Yes ? SourceZipMirror : SourceZipDirect;
-
-            try
-            {
-                Log("开始下载 dsh 源码 ...（" + url + "）");
-                string zipPath = Path.Combine(LauncherDir, "dsh-source.zip");
-                using (var client = new HttpClient { Timeout = TimeSpan.FromMinutes(15) })
-                using (var fs = new FileStream(zipPath, FileMode.Create, FileAccess.Write, FileShare.None))
-                {
-                    var resp = await client.GetAsync(url, HttpCompletionOption.ResponseHeadersRead);
-                    resp.EnsureSuccessStatusCode();
-                    await resp.Content.CopyToAsync(fs);
-                }
-                Log("下载完成（" + new FileInfo(zipPath).Length / 1024 / 1024 + " MB），正在解压 ...");
-
-                string extractDir = Path.Combine(LauncherDir, "dsh-extract");
-                if (Directory.Exists(extractDir)) Directory.Delete(extractDir, true);
-                ZipFile.ExtractToDirectory(zipPath, extractDir);
-                string inner = Directory.GetDirectories(extractDir).FirstOrDefault();
-                if (inner == null) throw new Exception("压缩包内容异常");
-
-                if (Directory.Exists(WorkDir)) throw new Exception("目标目录已存在：" + WorkDir);
-                Directory.Move(inner, WorkDir);
-                Log("源码已就绪：" + WorkDir);
-
-                // 清理下载临时文件
-                try { File.Delete(zipPath); Directory.Delete(extractDir, true); } catch { }
-
-                SaveConfig();
-                Log("正在安装依赖（pnpm install，可能需要几分钟）...");
-                bool ok = await RunProcessAsync(node, "\"" + FindPnpm() + "\" install", WorkDir, 1800);
-                if (!ok)
-                {
-                    Log("依赖安装失败，请手动在 " + WorkDir + " 执行 pnpm install。");
-                    return;
-                }
-                Log("安装完成！正在启动服务 ...");
-                await StartServerAsync();
-            }
-            catch (Exception ex)
-            {
-                Log("自动安装失败：" + ex.Message);
-                MessageBox.Show("自动安装失败：" + ex.Message + "\n\n可尝试：\n1. 切换下载方式重试\n2. 手动从 " + SourceRepoUrl + " 下载后选择目录", 
-                    "安装失败", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-            }
         }
 
         /// <summary>后台执行进程并把输出写入日志，返回是否成功退出（timeout 秒内）。</summary>
@@ -972,7 +849,7 @@ namespace DshLauncher
                 File.Copy(file, file.Replace(src, dst), false);
         }
 
-        private static string FindNode()
+        internal static string FindNode()
         {
             // 1) PATH 中查找 node（开源环境的主要途径）
             string pathNode = ResolveFromPath("node");
@@ -997,7 +874,7 @@ namespace DshLauncher
             return best ?? fallback;
         }
 
-        private static string FindPnpm()
+        internal static string FindPnpm()
         {
             // 1) PATH 中的 pnpm（npm 全局安装时 pnpm.cmd / pnpm 在 PATH，pnpm.cjs 在其同级 node_modules 下）
             string pnpmCmd = ResolveFromPath("pnpm.cmd") ?? ResolveFromPath("pnpm");
@@ -1010,6 +887,27 @@ namespace DshLauncher
             // 2) 本机已知路径回退
             if (File.Exists(PnpmCjs)) return PnpmCjs;
             return null;
+        }
+
+        /// <summary>
+        /// 定位 npm：优先 node 同目录的 npm.cmd（Node 官方 Windows 安装自带）；
+        /// 其次 node 同目录 node_modules/npm/bin/npm-cli.js（由 node 直接运行，不依赖 cmd shim）；
+        /// 最后 PATH 中的 npm.cmd。
+        /// 返回 (可执行文件, 需要前置的参数前缀)；npm-cli.js 情形 exe=node、prefix=带引号的 cli 路径。
+        /// </summary>
+        internal static (string exe, string argsPrefix) FindNpmCommand(string node)
+        {
+            if (!string.IsNullOrEmpty(node))
+            {
+                string dir = Path.GetDirectoryName(node);
+                string npmCmd = Path.Combine(dir, "npm.cmd");
+                if (File.Exists(npmCmd)) return (npmCmd, null);
+                string npmCli = Path.Combine(dir, "node_modules", "npm", "bin", "npm-cli.js");
+                if (File.Exists(npmCli)) return (node, "\"" + npmCli + "\"");
+            }
+            string fromPath = ResolveFromPath("npm.cmd");
+            if (fromPath != null) return (fromPath, null);
+            return (null, null);
         }
 
         private static string ResolveFromPath(string name)
@@ -1028,7 +926,7 @@ namespace DshLauncher
             return null;
         }
 
-        private static string NodeVersion(string nodeExe)
+        internal static string NodeVersion(string nodeExe)
         {
             try
             {
@@ -1192,17 +1090,56 @@ namespace DshLauncher
             }
         }
 
-        /// <summary>返回 "latest" 表示无更新；返回版本号表示远程新版本；null 表示检查失败。</summary>
+        /// <summary>
+        /// 返回 "latest" 表示无更新；返回版本号表示远程新版本；null 表示检查失败。
+        /// 多候选源依次尝试：raw GitHub → ghproxy 镜像 → npm registry → 国内 npm 镜像；
+        /// 自动读取 HTTPS_PROXY/HTTP_PROXY 环境变量（兼容代理环境，不影响系统设置）。
+        /// </summary>
         private static string CheckVersionRemote()
+        {
+            var candidates = new[]
+            {
+                "https://raw.githubusercontent.com/deepseek-ai/deepseek-harness/main/package.json",
+                "https://ghproxy.net/https://raw.githubusercontent.com/deepseek-ai/deepseek-harness/main/package.json",
+                "https://registry.npmjs.org/@deepseek-ai/dsh/latest",
+                "https://registry.npmmirror.com/@deepseek-ai/dsh/latest"
+            };
+            foreach (var url in candidates)
+            {
+                string json = TryFetchText(url, 8);
+                if (json == null) continue;
+                try
+                {
+                    using var doc = JsonDocument.Parse(json);
+                    if (doc.RootElement.TryGetProperty("version", out var v))
+                    {
+                        string remote = v.GetString();
+                        if (!string.IsNullOrEmpty(remote))
+                            return remote == LocalVersion ? "latest" : remote;
+                    }
+                }
+                catch { }
+            }
+            return null;
+        }
+
+        /// <summary>带代理感知的短超时抓取；失败返回 null。</summary>
+        private static string TryFetchText(string url, int timeoutSec)
         {
             try
             {
-                using var client = new HttpClient { Timeout = TimeSpan.FromSeconds(15) };
-                string json = client.GetStringAsync(
-                    "https://raw.githubusercontent.com/deepseek-ai/deepseek-harness/main/package.json").GetAwaiter().GetResult();
-                using var doc = JsonDocument.Parse(json);
-                string remote = doc.RootElement.GetProperty("version").GetString() ?? "未知";
-                return remote == LocalVersion ? "latest" : remote;
+                using var handler = new HttpClientHandler { UseProxy = true };
+                // 显式应用环境变量代理（gh/curl 习惯），未设置则走系统代理
+                string proxy = Environment.GetEnvironmentVariable("HTTPS_PROXY")
+                            ?? Environment.GetEnvironmentVariable("https_proxy")
+                            ?? Environment.GetEnvironmentVariable("HTTP_PROXY");
+                if (!string.IsNullOrEmpty(proxy))
+                {
+                    handler.Proxy = new System.Net.WebProxy(proxy);
+                    handler.UseProxy = true;
+                }
+                using var client = new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(timeoutSec) };
+                return client.GetStringAsync(url).GetAwaiter().GetResult();
             }
             catch
             {
