@@ -34,7 +34,9 @@ namespace DshLauncher
                 MainForm.LoadConfig();              // 安装/选择目录可能改写 workDir
             }
 
-            // 启动时检查更新（前置更新窗口）：检测到新版才弹窗
+            // 启动时检查更新（前置更新窗口）：检测到新版才弹窗。
+            // 时序保证：更新窗口（含更新执行）→ 窗口关闭 → 进入主界面 → OnShown 里才自动启动服务。
+            // 千万不要在更新窗口之前/期间启动 dsh 服务，否则更新覆盖源码时会报“文件被另一进程使用”。
             if (MainForm.CheckUpdateOnStart)
             {
                 string remote = Task.Run(MainForm.CheckVersionRemote).GetAwaiter().GetResult();
@@ -74,7 +76,7 @@ namespace DshLauncher
 
         // 布局常量
         private const int StatusBarHeight = 22;   // 底部状态条
-        private const int ActionsBarHeight = 48;  // 底部操作栏（展开时）
+        private const int ActionsBarHeight = 70;  // 底部操作栏（展开时：第一行按钮 + 第二行复选框）
         private const int LogPanelHeight = 168;   // 底部日志面板（展开时）
 
         // Node / pnpm 候选（按优先级；PATH 优先，以下作为回退）
@@ -98,15 +100,17 @@ namespace DshLauncher
         private Button _btnExternal;
         private Button _btnBackup;
         private Button _btnCheck;            // 检查更新
+        private Button _btnWebView;          // 安装/修复内置浏览器（WebView2 Runtime）
         private CheckBox _chkAutoStart;
         private CheckBox _chkAutoCheck;      // 启动时检查更新
         private CheckBox _chkNotify;         // 任务提醒（等待确认/任务完成时气泡+提示音）
+        private CheckBox _chkBackOnly;       // 后台才提醒（窗口在前端时不弹通知，需勾选任务提醒才生效）
 
-        // 事件监听（events.mux）：检测「需要审批」与「任务完成」
-        private System.Net.WebSockets.ClientWebSocket _eventWs;
+        // 事件监听（events.mux / events.host）：审批提醒 + 回合级任务完成提醒
         private System.Threading.CancellationTokenSource _eventCts;
-        private readonly Dictionary<string, string> _jobStates = new();    // jobId → status
-        private readonly HashSet<string> _notifiedApprovals = new();       // approvalId 去重
+        private readonly Dictionary<string, string> _lastAssistantText = new();   // sessionId → 最近一条模型答复文本（回合完成摘要）
+        private readonly HashSet<string> _subagentSessions = new();               // 子代理会话（其回合结束不弹通知）
+        private readonly HashSet<string> _notifiedApprovals = new();              // approvalId 去重
         private bool _eventMonitorStarted;
 
         private Panel _logPanel;             // 底部日志面板（默认收起）
@@ -133,7 +137,7 @@ namespace DshLauncher
 
         public MainForm()
         {
-            Text = "dsh-launcher";
+            Text = "Deepseek Harness";
             try { Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); } catch { }
             Font = new Font("Microsoft YaHei UI", 9.5f);
             ClientSize = new Size(1100, 720);
@@ -217,10 +221,12 @@ namespace DshLauncher
             _actionsPanel.Controls.Add(_btnExternal = MakeActionButton("外部浏览器", 300, 10, (x) => OpenExternalBrowser()));
             _actionsPanel.Controls.Add(_btnBackup = MakeActionButton("备份数据", 396, 10, (x) => BackupData()));
             _actionsPanel.Controls.Add(_btnCheck = MakeActionButton("检查更新", 492, 10, (x) => CheckForUpdates(interactive: true)));
+            _actionsPanel.Controls.Add(_btnWebView = MakeActionButton("修复浏览器", 588, 10, (x) => _ = TryInstallWebView2Async()));
+            // 第二行：复选框（独立一行，文字空间充裕）
             _actionsPanel.Controls.Add(_chkAutoStart = new CheckBox
             {
                 Text = "启动时自动运行",
-                Location = new Point(596, 13),
+                Location = new Point(12, 42),
                 Size = new Size(130, 22),
                 Checked = true,
                 Font = new Font(Font.FontFamily, 9f)
@@ -228,8 +234,8 @@ namespace DshLauncher
             _actionsPanel.Controls.Add(_chkAutoCheck = new CheckBox
             {
                 Text = "启动时检查更新",
-                Location = new Point(734, 13),
-                Size = new Size(150, 22),
+                Location = new Point(150, 42),
+                Size = new Size(140, 22),
                 Checked = CheckUpdateOnStart,
                 Font = new Font(Font.FontFamily, 9f)
             });
@@ -237,8 +243,16 @@ namespace DshLauncher
             _actionsPanel.Controls.Add(_chkNotify = new CheckBox
             {
                 Text = "任务提醒",
-                Location = new Point(892, 13),
-                Size = new Size(100, 22),
+                Location = new Point(300, 42),
+                Size = new Size(80, 22),
+                Checked = true,
+                Font = new Font(Font.FontFamily, 9f)
+            });
+            _actionsPanel.Controls.Add(_chkBackOnly = new CheckBox
+            {
+                Text = "后台才提醒",
+                Location = new Point(390, 42),
+                Size = new Size(110, 22),
                 Checked = true,
                 Font = new Font(Font.FontFamily, 9f)
             });
@@ -383,6 +397,8 @@ namespace DshLauncher
             {
                 Diagnose("OnShown: 内置浏览器初始化失败 - " + ex.GetType().Name + ": " + ex.Message + "\n" + ex.StackTrace);
                 Log("内置浏览器初始化失败（需安装 WebView2 Runtime）：" + ex.Message);
+                // 自动下载并静默安装 WebView2 Runtime，装好后重试内置浏览器
+                _ = TryInstallWebView2Async();
             }
 
             if (_chkAutoStart.Checked)
@@ -1106,6 +1122,7 @@ namespace DshLauncher
                 StopEventMonitor();
                 bool wasRunning = _managedServer != null && !_managedServer.HasExited;
                 if (wasRunning) StopServer();
+                await Task.Delay(1500);   // 等待进程退出/文件句柄释放
                 using var updater = new UpdateForm(LocalVersion, result);
                 updater.ShowDialog(this);
                 if (updater.Completed && wasRunning)
@@ -1150,13 +1167,15 @@ namespace DshLauncher
             }
         }
 
-        // ── 事件监听（任务提醒：等待确认 / 任务完成） ──────────────
+        // ── 事件监听（任务提醒：等待确认 / 回合级任务完成） ──────────
         private void StartEventMonitor()
         {
             if (_eventMonitorStarted || _eventCts != null) return;
             _eventCts = new System.Threading.CancellationTokenSource();
             _eventMonitorStarted = true;
-            _ = Task.Run(() => EventMonitorLoopAsync(_eventCts.Token));
+            // 双流：events.mux（审批 + 回合事件）+ events.host（会话元信息，用于过滤子代理会话）
+            _ = Task.Run(() => EventStreamLoopAsync("/api/events.mux", "事件监听", ProcessEvent, _eventCts.Token));
+            _ = Task.Run(() => EventStreamLoopAsync("/api/events.host", "主机事件监听", ProcessHostEvent, _eventCts.Token));
         }
 
         private void StopEventMonitor()
@@ -1165,33 +1184,31 @@ namespace DshLauncher
             try { _eventCts?.Cancel(); } catch { }
             try { _eventCts?.Dispose(); } catch { }
             _eventCts = null;
-            try { _eventWs?.Dispose(); } catch { }
-            _eventWs = null;
         }
 
-        private async Task EventMonitorLoopAsync(System.Threading.CancellationToken ct)
+        /// <summary>单条事件流循环：连接 → 逐条消息回调 → 断开 5 秒重连，直到取消。</summary>
+        private async Task EventStreamLoopAsync(string path, string name, Action<string> onMessage, System.Threading.CancellationToken ct)
         {
             while (!ct.IsCancellationRequested)
             {
                 try
                 {
                     using var ws = new System.Net.WebSockets.ClientWebSocket();
-                    _eventWs = ws;
-                    await ws.ConnectAsync(new Uri("ws://127.0.0.1:" + Port + "/api/events.mux"), ct);
-                    Log("事件监听已连接（任务提醒就绪）。");
+                    await ws.ConnectAsync(new Uri("ws://127.0.0.1:" + Port + path), ct);
+                    Log(name + "已连接。");
                     var buf = new byte[65536];
                     while (ws.State == System.Net.WebSockets.WebSocketState.Open && !ct.IsCancellationRequested)
                     {
                         var result = await ws.ReceiveAsync(new ArraySegment<byte>(buf), ct);
                         if (result.MessageType == System.Net.WebSockets.WebSocketMessageType.Close) break;
                         string text = System.Text.Encoding.UTF8.GetString(buf, 0, result.Count);
-                        ProcessEvent(text);
+                        onMessage(text);
                     }
                 }
                 catch (OperationCanceledException) { break; }
-                catch (Exception ex)
+                catch (Exception ex) when (!ct.IsCancellationRequested)
                 {
-                    Log("事件监听断开（" + ex.GetType().Name + "），5 秒后重连。");
+                    Log(name + "断开（" + ex.GetType().Name + "），5 秒后重连。");
                 }
                 try { await Task.Delay(5000, ct); } catch { break; }
             }
@@ -1217,25 +1234,113 @@ namespace DshLauncher
                     string reason = payload.TryGetProperty("reason", out var r) ? r.GetString() : "";
                     Notify("需要你的确认", "工具：" + tool + "\n" + Shorten(reason, 80));
                 }
-                else if (method == "session/jobs")
+                else if (method == "session/event")
                 {
-                    // 任务状态快照：检测 running → completed/failed 转变
-                    if (!payload.TryGetProperty("jobs", out var jobs) || jobs.ValueKind != JsonValueKind.Array) return;
-                    foreach (var job in jobs.EnumerateArray())
+                    // 回合事件：任务完成监听（turn/end）+ 最终答复摘要（assistant/message）
+                    ProcessSessionEvent(payload);
+                }
+            }
+            catch { }
+        }
+
+        /// <summary>
+        /// 回合级任务完成监听：以「回合结束（turn/end）」为准，不再按 job 状态转变弹通知。
+        /// 原因：session/jobs 快照包含所有工具调用/子代理 job（线缆无父子关系字段），
+        /// 且 job 在子进程退出时即结算、早于模型最终答复，两者都会造成误报与提前。
+        /// </summary>
+        private void ProcessSessionEvent(JsonElement payload)
+        {
+            string sessionId = payload.TryGetProperty("sessionId", out var sidEl) ? sidEl.GetString() ?? "" : "";
+            if (!payload.TryGetProperty("event", out var ev) || ev.ValueKind != JsonValueKind.Object) return;
+            string etype = ev.TryGetProperty("type", out var t) ? t.GetString() : "";
+            if (!ev.TryGetProperty("data", out var data) || data.ValueKind != JsonValueKind.Object) return;
+
+            if (etype == "assistant/message")
+            {
+                // 记录该会话最近一条模型答复，回合结束时作为「任务已完成」摘要
+                if (data.TryGetProperty("message", out var msg)
+                    && msg.TryGetProperty("content", out var content) && content.ValueKind == JsonValueKind.Array)
+                {
+                    var sb = new System.Text.StringBuilder();
+                    foreach (var block in content.EnumerateArray())
                     {
-                        string id = job.TryGetProperty("id", out var j) ? j.GetString() : "";
-                        string status = job.TryGetProperty("status", out var s) ? s.GetString() : "";
-                        if (string.IsNullOrEmpty(id) || string.IsNullOrEmpty(status)) continue;
-                        if (_jobStates.TryGetValue(id, out string prev) && prev != status
-                            && (prev == "running" || prev == "queued" || prev == "starting")
-                            && (status == "completed" || status == "failed" || status == "canceled"))
-                        {
-                            string label = job.TryGetProperty("label", out var l)
-                                ? Shorten(l.GetString(), 60) : id;
-                            Notify(status == "completed" ? "任务已完成" : "任务" + status, label);
-                        }
-                        _jobStates[id] = status;
+                        if (block.ValueKind == JsonValueKind.Object
+                            && block.TryGetProperty("text", out var txt) && txt.ValueKind == JsonValueKind.String)
+                            sb.Append(txt.GetString());
                     }
+                    string text = sb.ToString();
+                    if (!string.IsNullOrWhiteSpace(text))
+                    {
+                        if (_lastAssistantText.Count > 100) _lastAssistantText.Clear();
+                        _lastAssistantText[sessionId] = text;
+                    }
+                }
+            }
+            else if (etype == "turn/start")
+            {
+                // 新回合开始，清掉上一回合的旧摘要，避免串台
+                _lastAssistantText.Remove(sessionId);
+            }
+            else if (etype == "turn/end")
+            {
+                // 子代理会话的回合结束不打扰用户
+                if (_subagentSessions.Contains(sessionId)) return;
+
+                string reasonKind = "";
+                string errorMessage = "";
+                if (data.TryGetProperty("reason", out var reason) && reason.ValueKind == JsonValueKind.Object)
+                {
+                    reasonKind = reason.TryGetProperty("kind", out var k) ? k.GetString() ?? "" : "";
+                    if (reasonKind == "error"
+                        && reason.TryGetProperty("error", out var err) && err.ValueKind == JsonValueKind.Object
+                        && err.TryGetProperty("message", out var em))
+                        errorMessage = em.GetString() ?? "";
+                }
+                string summary = _lastAssistantText.TryGetValue(sessionId, out var s) ? s : "";
+                switch (reasonKind)
+                {
+                    case "completed":
+                        Notify("任务已完成", string.IsNullOrEmpty(summary) ? "本轮任务已完成。" : Shorten(summary, 80));
+                        break;
+                    case "error":
+                        Notify("任务失败", string.IsNullOrEmpty(errorMessage) ? "本轮任务出错。" : Shorten(errorMessage, 80));
+                        break;
+                    case "aborted":
+                        Notify("任务已取消", "本轮任务被取消。");
+                        break;
+                    // blocked / max-tokens / interrupted 等不弹通知
+                }
+            }
+        }
+
+        /// <summary>host 流：跟踪子代理会话（host/session-added 带 origin=subagent / parentSessionId），过滤其回合结束通知。</summary>
+        private void ProcessHostEvent(string text)
+        {
+            try
+            {
+                using var doc = JsonDocument.Parse(text);
+                var root = doc.RootElement;
+                if (!root.TryGetProperty("method", out var m)) return;
+                string method = m.GetString();
+                if (!root.TryGetProperty("payload", out var payload)) return;
+
+                if (method == "host/session-added")
+                {
+                    string sessionId = payload.TryGetProperty("sessionId", out var s) ? s.GetString() ?? "" : "";
+                    if (string.IsNullOrEmpty(sessionId)) return;
+                    string origin = payload.TryGetProperty("origin", out var o) ? o.GetString() : "";
+                    if (origin == "subagent" || payload.TryGetProperty("parentSessionId", out _))
+                    {
+                        if (_subagentSessions.Count > 500) _subagentSessions.Clear();
+                        _subagentSessions.Add(sessionId);
+                    }
+                }
+                else if (method == "host/session-removed")
+                {
+                    string sessionId = payload.TryGetProperty("sessionId", out var s) ? s.GetString() ?? "" : "";
+                    if (string.IsNullOrEmpty(sessionId)) return;
+                    _subagentSessions.Remove(sessionId);
+                    _lastAssistantText.Remove(sessionId);
                 }
             }
             catch { }
@@ -1256,6 +1361,8 @@ namespace DshLauncher
                     Invoke((Action)(() =>
                     {
                         if (!_chkNotify.Checked) return;
+                        // 「后台才提醒」：窗口在前端（用户正看着界面）时不弹通知
+                        if (_chkBackOnly.Checked && Form.ActiveForm == this) return;
                         try { System.Media.SystemSounds.Exclamation.Play(); } catch { }
                         try { _trayIcon.ShowBalloonTip(5000, "dsh-launcher - " + title, text, ToolTipIcon.Info); } catch { }
                     }));
@@ -1320,15 +1427,125 @@ namespace DshLauncher
             }
         }
 
+        // ── 外部浏览器：自动探测现代浏览器（Edge/Chrome/Firefox），不再依赖系统默认关联 ──
+        private static readonly string[] BrowserCandidates =
+        {
+            @"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+            @"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+            @"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            @"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+            @"C:\Program Files\Mozilla Firefox\firefox.exe",
+            @"C:\Program Files (x86)\Mozilla Firefox\firefox.exe"
+        };
+
+        private string FindModernBrowser()
+        {
+            foreach (var c in BrowserCandidates)
+                if (File.Exists(c)) return c;
+            // 注册表 App Paths（用户自定义安装位置）
+            foreach (var name in new[] { "msedge.exe", "chrome.exe", "firefox.exe" })
+            {
+                try
+                {
+                    using var key = Microsoft.Win32.Registry.LocalMachine.OpenSubKey(
+                        @"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\" + name);
+                    if (key != null)
+                    {
+                        string p = key.GetValue(null) as string;
+                        if (!string.IsNullOrEmpty(p) && File.Exists(p)) return p;
+                    }
+                }
+                catch { }
+            }
+            return null;
+        }
+
         private void OpenExternalBrowser()
         {
             try
             {
+                string browser = FindModernBrowser();
+                if (browser != null)
+                {
+                    string name = Path.GetFileNameWithoutExtension(browser).ToLowerInvariant();
+                    // Edge/Chrome 用 --app 模式（无地址栏更像内置浏览器）；Firefox 不支持，直接开 URL
+                    string args = name == "firefox" ? UiUrl : "--app=" + UiUrl;
+                    Process.Start(new ProcessStartInfo(browser, args) { UseShellExecute = false });
+                    Log("已用 " + Path.GetFileName(browser) + " 打开外部浏览器。");
+                    return;
+                }
                 Process.Start(new ProcessStartInfo(UiUrl) { UseShellExecute = true });
+                Log("未找到 Edge/Chrome/Firefox，已通过系统默认浏览器打开。");
             }
             catch (Exception ex)
             {
                 Log("打开外部浏览器失败：" + ex.Message);
+                MessageBox.Show("打开外部浏览器失败：\n" + ex.Message +
+                    "\n\n请安装 Edge 或 Chrome，或使用内置浏览器（操作栏「修复浏览器」可自动安装 WebView2 Runtime）。",
+                    "打开浏览器失败", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            }
+        }
+
+        // ── WebView2 Runtime 自动安装（内置浏览器） ──────────────
+        private const string WebView2BootstrapperUrl = @"https://go.microsoft.com/fwlink/p/?LinkId=2124703";
+
+        /// <summary>
+        /// 下载并静默安装 WebView2 Runtime（Evergreen 引导安装器，约 2MB，可装到当前用户、无需管理员），
+        /// 装好后自动重试初始化内置浏览器。供 OnShown 失败时自动调用，也可由操作栏「修复浏览器」按钮手动触发。
+        /// </summary>
+        private async Task TryInstallWebView2Async()
+        {
+            try
+            {
+                var r = MessageBox.Show(
+                    "内置浏览器需要 WebView2 Runtime。\n\n" +
+                    "是否自动下载并静默安装？（约 2MB，安装到当前用户，无需管理员权限）",
+                    "安装/修复内置浏览器", MessageBoxButtons.YesNo, MessageBoxIcon.Question);
+                if (r != DialogResult.Yes) return;
+
+                string exe = Path.Combine(LauncherDir, "MicrosoftEdgeWebview2Setup.exe");
+                Log("正在下载 WebView2 Runtime 安装器 ...");
+                using (var client = new HttpClient { Timeout = TimeSpan.FromMinutes(10) })
+                {
+                    byte[] data = await client.GetByteArrayAsync(WebView2BootstrapperUrl);
+                    File.WriteAllBytes(exe, data);
+                }
+                Log("安装器已下载（" + new FileInfo(exe).Length / 1024 + " KB），正在静默安装 ...");
+
+                using var installer = Process.Start(new ProcessStartInfo(exe, "/silent /install")
+                {
+                    UseShellExecute = false,
+                    CreateNoWindow = true
+                });
+                if (installer == null) throw new Exception("无法启动 WebView2 安装器");
+                using (var cts = new System.Threading.CancellationTokenSource(TimeSpan.FromMinutes(5)))
+                {
+                    await installer.WaitForExitAsync(cts.Token);
+                }
+                try { File.Delete(exe); } catch { }
+                Log("WebView2 安装进程已退出（代码 " + installer.ExitCode + "），重新初始化内置浏览器 ...");
+
+                try
+                {
+                    var env = await Microsoft.Web.WebView2.Core.CoreWebView2Environment.CreateAsync(
+                        browserExecutableFolder: null, userDataFolder: WebViewDataDir);
+                    await _web.EnsureCoreWebView2Async(env);
+                    Log("内置浏览器已初始化（WebView2 安装后）。");
+                }
+                catch (Exception ex2)
+                {
+                    Diagnose("WebView2 安装后初始化仍失败 - " + ex2.GetType().Name + ": " + ex2.Message);
+                    MessageBox.Show("内置浏览器仍然不可用：\n" + ex2.Message +
+                        "\n\n请手动安装 WebView2 Runtime：\nhttps://developer.microsoft.com/microsoft-edge/webview2/",
+                        "内置浏览器不可用", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                }
+            }
+            catch (Exception ex)
+            {
+                Log("WebView2 自动安装失败：" + ex.Message);
+                MessageBox.Show("自动安装 WebView2 失败：" + ex.Message +
+                    "\n\n请手动到以下地址安装：\nhttps://developer.microsoft.com/microsoft-edge/webview2/",
+                    "安装失败", MessageBoxButtons.OK, MessageBoxIcon.Warning);
             }
         }
 

@@ -2,12 +2,14 @@
 
 一个把 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（dsh）Web 界面包装成桌面软件的一键启动器（Windows）。
 
-- 内置 WebView2 浏览器，打开即桌面软件外观
+- 内置 WebView2 浏览器，打开即桌面软件外观；**Runtime 缺失时自动下载静默安装**，操作栏可手动「修复浏览器」
 - 一键启动/停止服务，自动打开 dsh 界面
 - 首次使用自动引导：自动下载 dsh 源码（支持国内镜像）或手动选择已有目录
 - 端口占用自动检测、加载失败自动重试
+- **任务提醒**：回合级任务完成/失败/取消气泡提醒（按回合结束判定、过滤子代理会话，可选「后台才提醒」）
 - 关闭窗口自动缩到系统托盘，服务持续后台运行（右键托盘可操作/退出）
 - 用户数据独立存放（`userdata` 目录），更新/重装不丢失，支持一键备份
+- **一键更新**：文件级合并覆盖、保留你自行添加的文件、替换前二次确认、占用进程自动清理、失败可重试
 - **全部路径以启动器所在文件夹为根，放任意盘符/目录均可使用**
 
 ---
@@ -20,8 +22,8 @@
 ```
 https://github.com/xxm-huijiong/deepseek-harness-launcher/releases
 ```
-下载 `dsh-launcher.exe`（框架依赖版，约 1.6MB）。
-运行前先确认已满足「环境要求」（.NET 7 Desktop Runtime / WebView2 / Node.js / pnpm）。
+下载 `dsh-launcher.exe`（框架依赖版，约 1.6MB；需目标机装有 .NET 7 Desktop Runtime）或 `dsh-launcher-standalone.exe`（自包含版，约 150MB，免装 .NET）。
+运行前先确认已满足「环境要求」（.NET 7 Desktop Runtime / WebView2 / Node.js / pnpm；WebView2 缺失时启动器会自动下载安装）。
 
 **方式二：从源码自行编译**
 
@@ -36,7 +38,7 @@ https://github.com/xxm-huijiong/deepseek-harness-launcher/releases
 | 依赖 | 作用 | 下载 |
 |---|---|---|
 | .NET 7 Desktop Runtime | 运行启动器本体 | https://dotnet.microsoft.com/download/dotnet/7.0 |
-| WebView2 Runtime | 内置浏览器内核 | Win11 自带；Win10 多数已装，缺失时启动器会提示 |
+| WebView2 Runtime | 内置浏览器内核 | Win11 自带；缺失时启动器会**自动下载并静默安装**（约 2MB，无需管理员），也可点「修复浏览器」手动安装 |
 | Node.js ≥ 22.19 | 运行 dsh 服务 | https://nodejs.org |
 | pnpm | 安装 dsh 依赖 | 装完 Node 后执行 `npm install -g pnpm` |
 
@@ -86,22 +88,25 @@ pnpm dsh web
 | .NET 7 SDK | 下载：https://dotnet.microsoft.com/download/dotnet/7.0 （含编译与运行所需） |
 | 验证 | 命令行执行 `dotnet --version`，能输出版本号即可 |
 
-**一键编译**：源码目录下有 `build.bat`，双击运行即可，产物直接输出为源码根目录下的 `dsh-launcher.exe`：
+**一键编译**：源码目录下有 `build.bat`，支持两种发布模式：
 
-```bat
-:: build.bat 内容（等价于手动执行）：
-dotnet publish -c Release -r win-x64 --self-contained false -p:PublishSingleFile=true
-:: 产物复制：bin\Release\net7.0-windows\win-x64\publish\DshLauncher.exe → dsh-launcher.exe
-```
+| 命令 | 产物 | 说明 |
+|---|---|---|
+| `build.bat` | `dsh-launcher.exe`（约 1.6MB） | 框架依赖版：目标机需已装 .NET 7 Desktop Runtime |
+| `build.bat self` | `dsh-launcher-standalone.exe`（约 150MB） | 自包含版：内置 .NET 运行时，免装即可运行（适合全新虚拟机） |
 
-**手动命令**：
+> **运行入口永远是源码根目录下的 `dsh-launcher.exe`**；
+> `bin\Release\net7.0-windows\win-x64\DshLauncher.exe`（约 350KB）只是中间构建产物，不能直接运行。
+> 若复制报"文件被占用"，先关闭正在运行的启动器再编译。
+
+**手动命令**（等价于 build.bat 默认模式）：
 ```bash
 cd <启动器目录>
 dotnet publish -c Release -r win-x64 --self-contained false -p:PublishSingleFile=true
-# 产物：bin\Release\net7.0-windows\win-x64\publish\DshLauncher.exe
+# 产物：bin\Release\net7.0-windows\win-x64\publish\DshLauncher.exe，复制为根目录 dsh-launcher.exe
 ```
 
-> 源码仅 3 个文件：`Program.cs`、`DshLauncher.csproj`、`deepseek.ico`（另加 NuGet 依赖 `Microsoft.Web.WebView2`，首次编译自动还原）。
+> 源码文件：`Program.cs`、`InstallForm.cs`、`UpdateForm.cs`、`DshLauncher.csproj`（另加 NuGet 依赖 `Microsoft.Web.WebView2`，首次编译自动还原）。
 > 所有运行时路径以 exe 所在目录为根（`Environment.ProcessPath`），无需修改任何配置即可换盘符/换目录运行。
 
 ---
@@ -110,7 +115,8 @@ dotnet publish -c Release -r win-x64 --self-contained false -p:PublishSingleFile
 
 ```
 <启动器目录>\                    ← 启动器所在文件夹（可放任意盘）
-├─ dsh-launcher.exe          ← 启动器主程序
+├─ dsh-launcher.exe          ← 启动器主程序（框架依赖版）
+├─ dsh-launcher-standalone.exe ← 自包含版（`build.bat self` 产物，可选）
 ├─ config.json                   ← 配置（workDir = dsh 源码目录）
 ├─ userdata\                     ← ★ 用户数据（最重要）
 │  ├─ sessions\                  ← 聊天记录
@@ -134,27 +140,40 @@ dotnet publish -c Release -r win-x64 --self-contained false -p:PublishSingleFile
 - **启动服务**：打开启动器后自动启动（可取消「启动时自动运行」）；也可在 `≡ 操作` 或托盘右键菜单中手动操作
 - **停止服务**：`≡ 操作` → 停止服务；或托盘右键 → 停止服务
 - **缩到托盘**：点窗口「✕」会隐藏到系统托盘（右下角），**服务继续后台运行**；双击托盘图标恢复窗口，**右键托盘菜单可完成所有操作**（启动/停止/刷新/浏览器/备份/检查更新/退出）
-- **刷新 / 外部浏览器**：内置浏览器异常时可用「浏览器打开」在系统浏览器打开 `http://127.0.0.1:3080/web/`
+- **刷新 / 外部浏览器**：内置浏览器异常时可刷新，或用「外部浏览器」在 **Edge/Chrome/Firefox（自动探测，不依赖系统默认浏览器）** 打开 `http://127.0.0.1:3080/web/`
+- **修复浏览器**：内置浏览器不可用（缺 WebView2 Runtime）时，点「安装/修复内置浏览器」自动下载并静默安装（约 2MB，无需管理员），装好自动重试
 - **备份数据**：一键把 `userdata` 用户数据复制到 `backups\backup-<时间戳>\userdata\`（排除自动生成的 profiles）；恢复时把内容复制回 `userdata` 并删除其中的 `profiles` 即可
-- **检查更新**：对比本地 dsh 版本与 GitHub 官方版本，发现新版会提示打开仓库；可在「启动时检查更新」关闭自动检查
+- **检查更新**：启动时自动对比本地 dsh 版本与 GitHub 官方版本；发现新版弹出**前置更新窗口**，一键自动更新（详见下方「更新 dsh」）
+- **任务提醒**：任务完成/失败/取消时气泡提醒（按"回合结束"判定，子代理会话不打扰）；勾选「后台才提醒」（默认开启）则**仅当启动器窗口不在前端时**才提醒
+- **选项行**：`≡ 操作` 面板分两行——第一行按钮，第二行四个选项（启动时自动运行 / 启动时检查更新 / 任务提醒 / 后台才提醒）
 - **启动画面**：`pics\` 下的图片（jpg/png/gif/bmp）会在启动等待期随机展示，gif 可播放动画
 
 ---
 
 ## 更新 dsh
 
-方式一（源码为 git 仓库时）：双击 `update-dsh.bat`（自动 `git pull` + 安装依赖 + 构建）。
+**推荐：启动器内置一键更新** —— 启动时（或点「检查更新」）发现新版后，在更新窗口点「立即更新」：
 
-方式二：手动从 [GitHub](https://github.com/deepseek-ai/deepseek-harness) 下载最新源码替换。
+1. 自动停止占用源码目录的进程（3080 端口监听 + 所有命令行指向源码目录的 node/git 进程）
+2. git 仓库 → `git fetch + reset`；普通目录 → 下载官方源码 zip 后**文件级合并覆盖**
+3. 合并前二次确认：将覆盖同名文件；你自行添加的文件（新包里没有的，如 `_launcher_build*`、`.agents` 等）自动保留，建议先手动备份
+4. 自动 `pnpm install` + `pnpm run build`；文件被占用时自动重试并提示具体路径，失败可整流程重试
 
 > 更新只动 dsh 源码目录，`userdata` 用户数据不受影响。
+> 若源码是 git 仓库，也可双击 `update-dsh.bat` 手动更新（git pull + 安装依赖 + 构建）。
 
 ---
 
 ## 常见问题
 
-**Q：内置浏览器空白 / 显示不全？**
-点 `≡ 操作` → 刷新，或改用「浏览器打开」。
+**Q：内置浏览器空白 / 不可用？**
+点 `≡ 操作` → 刷新；若提示缺少 WebView2 Runtime，点「修复浏览器」自动下载安装（约 2MB）。
+
+**Q：更新时提示"文件被另一进程使用"？**
+新版更新已改为文件级合并覆盖 + 占用进程自动清理 + 自动重试；若仍提示，说明存在未识别进程占用，按提示的具体文件路径关闭对应程序后重试。
+
+**Q：通知太频繁？**
+「后台才提醒」默认开启：只有启动器窗口不在前端时才弹通知；也可取消「任务提醒」彻底关闭。
 
 **Q：端口 3080 被占用？**
 启动器会检测并提示；若为其他程序占用，请先释放。

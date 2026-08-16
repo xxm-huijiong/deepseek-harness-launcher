@@ -18,6 +18,11 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <!-- 备份目录不参与编译（否则备份的 .cs 会与源码重复定义） -->
+    <Compile Remove="backups\**\*.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
     <PackageReference Include="Microsoft.Web.WebView2" Version="1.0.2739.15" />
   </ItemGroup>
 
