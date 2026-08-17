@@ -238,6 +238,11 @@ namespace DshLauncher
                     return;
                 }
 
+                // 4.5) 补装 tsdown 的 optional peer 依赖 unrun（pnpm 默认不装 optional peer，
+                //      干净环境 pnpm run build 会报 Failed to import module "unrun"）
+                SetStep("补装构建依赖（unrun）...", 70);
+                await RunProcessAsync(_node, "\"" + pnpm + "\" add -Dw unrun", MainForm.WorkDir, 600);
+
                 // 5) 构建（官方流程 pnpm run build：生成 web 前端产物 lib/dist，缺失会导致 MissingClientBundleError）
                 SetStep("构建前端产物（pnpm run build，可能需要几分钟）...", 80);
                 Log("开始构建（pnpm run build）...");

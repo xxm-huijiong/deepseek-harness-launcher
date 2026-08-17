@@ -21,6 +21,27 @@ namespace DshLauncher
         [STAThread]
         private static void Main()
         {
+            try
+            {
+                MainInternal();
+            }
+            catch (Exception ex)
+            {
+                // 启动即崩溃时写入诊断日志，便于定位
+                try
+                {
+                    System.IO.File.AppendAllText(
+                        MainForm.LogFile,
+                        "[" + DateTime.Now.ToString("HH:mm:ss") + "] [FATAL] " +
+                        ex.GetType().Name + ": " + ex.Message + "\n" + ex.StackTrace + "\n");
+                }
+                catch { }
+                throw;
+            }
+        }
+
+        private static void MainInternal()
+        {
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
             MainForm.LoadConfig();   // 读取 config.json（可重定向 dsh 源码目录）
@@ -34,18 +55,15 @@ namespace DshLauncher
                 MainForm.LoadConfig();              // 安装/选择目录可能改写 workDir
             }
 
-            // 启动时检查更新（前置更新窗口）：检测到新版才弹窗。
+            // 启动时检查更新（前置更新窗口）：立即弹出「检查更新」窗口并显示检查状态，
+            // 检查完成后窗口内给出结果（有新版→立即更新；无新版→自动关闭进入主界面）。
             // 时序保证：更新窗口（含更新执行）→ 窗口关闭 → 进入主界面 → OnShown 里才自动启动服务。
             // 千万不要在更新窗口之前/期间启动 dsh 服务，否则更新覆盖源码时会报“文件被另一进程使用”。
             if (MainForm.CheckUpdateOnStart)
             {
-                string remote = Task.Run(MainForm.CheckVersionRemote).GetAwaiter().GetResult();
-                if (remote != null && remote != "latest")
-                {
-                    using var updater = new UpdateForm(MainForm.LocalVersion, remote);
-                    Application.Run(updater);
-                    // 更新成功后直接进入主界面（新版源码已就绪）
-                }
+                using var updater = new UpdateForm(MainForm.LocalVersion);
+                Application.Run(updater);
+                // 更新成功后直接进入主界面（新版源码已就绪）
             }
 
             Application.Run(new MainForm());
@@ -66,9 +84,12 @@ namespace DshLauncher
         internal const string SourceZipDirect = @"https://github.com/deepseek-ai/deepseek-harness/archive/refs/heads/master.zip";          // 直连下载（官方默认分支为 master）
         internal const string SourceZipMirror = @"https://ghproxy.net/https://github.com/deepseek-ai/deepseek-harness/archive/refs/heads/master.zip";  // 国内镜像下载
         internal static readonly string[] SourceZipMirrors = {                          // 镜像候选（按顺序尝试，失败自动切换）
-            @"https://ghproxy.net/https://github.com/deepseek-ai/deepseek-harness/archive/refs/heads/master.zip",
+            SourceZipDirect,                                                             // 直连优先：走系统/环境代理通常最快且最稳定
+            @"https://ghproxy.net/https://github.com/deepseek-ai/deepseek-harness/archive/refs/heads/master.zip",   // 多个国内镜像（GitHub 会限流，作保底）
             @"https://gh-proxy.com/https://github.com/deepseek-ai/deepseek-harness/archive/refs/heads/master.zip",
-            SourceZipDirect
+            @"https://ghfast.top/https://github.com/deepseek-ai/deepseek-harness/archive/refs/heads/master.zip",
+            @"https://gh.llkk.cc/https://github.com/deepseek-ai/deepseek-harness/archive/refs/heads/master.zip",
+            @"https://github.moeyy.xyz/https://github.com/deepseek-ai/deepseek-harness/archive/refs/heads/master.zip"
         };
 
         private const int Port = 3080;
@@ -101,6 +122,8 @@ namespace DshLauncher
         private Button _btnBackup;
         private Button _btnCheck;            // 检查更新
         private Button _btnWebView;          // 安装/修复内置浏览器（WebView2 Runtime）
+        private Button _btnChooseDir;        // 选择 dsh 源码目录
+        private Button _btnExit;             // 退出程序
         private CheckBox _chkAutoStart;
         private CheckBox _chkAutoCheck;      // 启动时检查更新
         private CheckBox _chkNotify;         // 任务提醒（等待确认/任务完成时气泡+提示音）
@@ -119,9 +142,13 @@ namespace DshLauncher
         private WebView2 _web;
         private PictureBox _splash;          // 启动画面（等待期随机图片）
         private NotifyIcon _trayIcon;        // 系统托盘图标
-        private ToolStripMenuItem _menuStart; // 托盘菜单：启动服务
-        private ToolStripMenuItem _menuStop;  // 托盘菜单：停止服务
-        private bool _forceExit;             // 托盘「退出」触发真正退出
+        private ToolStripMenuItem _menuStart;   // 托盘菜单：启动服务
+        private ToolStripMenuItem _menuStop;    // 托盘菜单：停止服务
+        private ToolStripMenuItem _menuAutoStart; // 托盘菜单选项：启动时自动运行
+        private ToolStripMenuItem _menuAutoCheck; // 托盘菜单选项：启动时检查更新
+        private ToolStripMenuItem _menuNotify;    // 托盘菜单选项：任务提醒
+        private ToolStripMenuItem _menuBackOnly;  // 托盘菜单选项：后台才提醒
+        private bool _forceExit;               // 托盘「退出」触发真正退出
         private bool _trayNotified;          // 首次隐藏到托盘的气泡提示已显示
 
         // ── 运行状态 ──────────────────────────────────────────────
@@ -164,13 +191,38 @@ namespace DshLauncher
             var trayMenu = new ContextMenuStrip();
             trayMenu.Items.Add("显示主窗口", null, (s, e) => ShowMainWindow());
             trayMenu.Items.Add(new ToolStripSeparator());
+
+            // ── 操作组 ────────────────────────────────────────────
             trayMenu.Items.Add(_menuStart = new ToolStripMenuItem("启动服务", null, (s, e) => _ = StartServerAsync()));
             trayMenu.Items.Add(_menuStop = new ToolStripMenuItem("停止服务", null, (s, e) => StopServer()));
+            trayMenu.Items.Add(new ToolStripSeparator());
             trayMenu.Items.Add("刷新页面", null, (s, e) => ReloadUi());
             trayMenu.Items.Add("浏览器打开", null, (s, e) => OpenExternalBrowser());
             trayMenu.Items.Add(new ToolStripSeparator());
             trayMenu.Items.Add("备份数据", null, (s, e) => BackupData());
             trayMenu.Items.Add("检查更新", null, (s, e) => CheckForUpdates(interactive: true));
+            trayMenu.Items.Add("修复浏览器", null, (s, e) => _ = TryInstallWebView2Async());
+            trayMenu.Items.Add("选择 dsh 目录", null, (s, e) => ChooseDshDirectoryFromMain());
+
+            // ── 选项组（勾选，与主窗口操作栏复选框同步） ──────────
+            trayMenu.Items.Add(new ToolStripSeparator());
+            _menuAutoStart = new ToolStripMenuItem("启动时自动运行") { CheckOnClick = true, Checked = true };
+            _menuAutoStart.CheckedChanged += (s, e) => SyncCheckbox(_chkAutoStart, _menuAutoStart.Checked);
+            trayMenu.Items.Add(_menuAutoStart);
+
+            _menuAutoCheck = new ToolStripMenuItem("启动时检查更新") { CheckOnClick = true, Checked = CheckUpdateOnStart };
+            // 持久化由复选框自己的 CheckedChanged 处理（SyncCheckbox 设置后自动触发）
+            _menuAutoCheck.CheckedChanged += (s, e) => SyncCheckbox(_chkAutoCheck, _menuAutoCheck.Checked);
+            trayMenu.Items.Add(_menuAutoCheck);
+
+            _menuNotify = new ToolStripMenuItem("任务提醒") { CheckOnClick = true, Checked = true };
+            _menuNotify.CheckedChanged += (s, e) => SyncCheckbox(_chkNotify, _menuNotify.Checked);
+            trayMenu.Items.Add(_menuNotify);
+
+            _menuBackOnly = new ToolStripMenuItem("后台才提醒") { CheckOnClick = true, Checked = true };
+            _menuBackOnly.CheckedChanged += (s, e) => SyncCheckbox(_chkBackOnly, _menuBackOnly.Checked);
+            trayMenu.Items.Add(_menuBackOnly);
+
             trayMenu.Items.Add(new ToolStripSeparator());
             trayMenu.Items.Add("退出", null, (s, e) => ExitApp());
             _trayIcon.ContextMenuStrip = trayMenu;
@@ -222,6 +274,8 @@ namespace DshLauncher
             _actionsPanel.Controls.Add(_btnBackup = MakeActionButton("备份数据", 396, 10, (x) => BackupData()));
             _actionsPanel.Controls.Add(_btnCheck = MakeActionButton("检查更新", 492, 10, (x) => CheckForUpdates(interactive: true)));
             _actionsPanel.Controls.Add(_btnWebView = MakeActionButton("修复浏览器", 588, 10, (x) => _ = TryInstallWebView2Async()));
+            _actionsPanel.Controls.Add(_btnChooseDir = MakeActionButton("选择 dsh 目录", 684, 10, (x) => ChooseDshDirectoryFromMain(), 104));
+            _actionsPanel.Controls.Add(_btnExit = MakeActionButton("退出", 792, 10, (x) => ExitApp()));
             // 第二行：复选框（独立一行，文字空间充裕）
             _actionsPanel.Controls.Add(_chkAutoStart = new CheckBox
             {
@@ -231,6 +285,7 @@ namespace DshLauncher
                 Checked = true,
                 Font = new Font(Font.FontFamily, 9f)
             });
+            _chkAutoStart.CheckedChanged += (s, e) => { if (_menuAutoStart != null) _menuAutoStart.Checked = _chkAutoStart.Checked; };
             _actionsPanel.Controls.Add(_chkAutoCheck = new CheckBox
             {
                 Text = "启动时检查更新",
@@ -239,7 +294,11 @@ namespace DshLauncher
                 Checked = CheckUpdateOnStart,
                 Font = new Font(Font.FontFamily, 9f)
             });
-            _chkAutoCheck.CheckedChanged += (s, e) => { CheckUpdateOnStart = _chkAutoCheck.Checked; SaveConfig(); };
+            _chkAutoCheck.CheckedChanged += (s, e) =>
+            {
+                if (_menuAutoCheck != null) _menuAutoCheck.Checked = _chkAutoCheck.Checked;
+                CheckUpdateOnStart = _chkAutoCheck.Checked; SaveConfig();
+            };
             _actionsPanel.Controls.Add(_chkNotify = new CheckBox
             {
                 Text = "任务提醒",
@@ -248,6 +307,7 @@ namespace DshLauncher
                 Checked = true,
                 Font = new Font(Font.FontFamily, 9f)
             });
+            _chkNotify.CheckedChanged += (s, e) => { if (_menuNotify != null) _menuNotify.Checked = _chkNotify.Checked; };
             _actionsPanel.Controls.Add(_chkBackOnly = new CheckBox
             {
                 Text = "后台才提醒",
@@ -256,6 +316,7 @@ namespace DshLauncher
                 Checked = true,
                 Font = new Font(Font.FontFamily, 9f)
             });
+            _chkBackOnly.CheckedChanged += (s, e) => { if (_menuBackOnly != null) _menuBackOnly.Checked = _chkBackOnly.Checked; };
             Controls.Add(_actionsPanel);
 
             // 内置浏览器（手动布局）
@@ -341,13 +402,13 @@ namespace DshLauncher
             return l;
         }
 
-        private Button MakeActionButton(string text, int x, int y, Action<object> onClick)
+        private Button MakeActionButton(string text, int x, int y, Action<object> onClick, int width = 84)
         {
             var b = new Button
             {
                 Text = text,
                 Location = new Point(x, y),
-                Size = new Size(84, 28),
+                Size = new Size(width, 28),
                 Font = new Font(Font.FontFamily, 9f),
                 Cursor = Cursors.Hand
             };
@@ -829,6 +890,52 @@ namespace DshLauncher
         internal static bool HasDshSource()
         {
             return HasDshSourceAt(WorkDir);
+        }
+
+        /// <summary>
+        /// 弹出目录选择框，让用户手动指定 dsh 源码目录并保存到 config。
+        /// 校验所选目录必须是有效 dsh 源码目录（含 package.json 与 apps/cli）。
+        /// 返回新目录路径；用户取消或目录无效返回 null。
+        /// 供更新窗口「选择 dsh 目录」与主界面操作栏按钮共用。
+        /// </summary>
+        internal static string SelectAndSetDshDirectory(IWin32Window owner)
+        {
+            using var dlg = new FolderBrowserDialog
+            {
+                Description = "请选择 DeepSeek Harness 源码目录（需包含 package.json）",
+                UseDescriptionForTitle = true
+            };
+            if (dlg.ShowDialog(owner) != DialogResult.OK) return null;
+            if (!HasDshSourceAt(dlg.SelectedPath))
+            {
+                MessageBox.Show(owner,
+                    "所选目录不是有效的 dsh 源码目录（缺少 package.json 或 apps/cli）。",
+                    "目录无效", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return null;
+            }
+            WorkDir = dlg.SelectedPath;
+            SaveConfig();
+            return dlg.SelectedPath;
+        }
+
+        /// <summary>主窗口操作栏「选择 dsh 目录」：切换源码目录后提示重启服务以生效。</summary>
+        private void ChooseDshDirectoryFromMain()
+        {
+            string path = SelectAndSetDshDirectory(this);
+            if (path == null) return;   // 用户取消或目录无效
+            Log("已切换 dsh 源码目录：" + path + "（本地版本 " + LocalVersion + "）");
+            MessageBox.Show(this,
+                "已选择 dsh 源码目录：\n" + path + "\n\n" +
+                "若服务正在运行，请先「停止服务」再「启动服务」以使用新目录。",
+                "选择 dsh 目录", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }
+
+        /// <summary>把托盘菜单勾选项的状态同步到主窗口复选框。
+        /// 仅当复选框存在时设置（菜单在 BuildUi 之前创建，复选框可能尚未生成）。
+        /// 设置 Checked 会触发复选框的 CheckedChanged，持久化等逻辑由它负责。</summary>
+        private void SyncCheckbox(CheckBox box, bool value)
+        {
+            if (box != null && box.Checked != value) box.Checked = value;
         }
 
         /// <summary>后台执行进程并把输出写入日志，返回是否成功退出（timeout 秒内）。</summary>
@@ -1395,7 +1502,7 @@ namespace DshLauncher
                     {
                         string remote = v.GetString();
                         if (!string.IsNullOrEmpty(remote))
-                            return remote == LocalVersion ? "latest" : remote;
+                            return IsRemoteNewer(LocalVersion, remote) ? remote : "latest";
                     }
                 }
                 catch { }
@@ -1403,13 +1510,55 @@ namespace DshLauncher
             return null;
         }
 
-        /// <summary>带代理感知的短超时抓取；失败返回 null。</summary>
-        private static string TryFetchText(string url, int timeoutSec)
+        /// <summary>
+        /// 语义化版本比较：判断 remote 是否比 local 新。
+        /// 支持 MAJOR.MINOR.PATCH 及 prerelease（如 0.1.0-rc.5）。无 prerelease 视为最稳定（比任何带 prerelease 的新）。
+        /// </summary>
+        private static bool IsRemoteNewer(string local, string remote)
         {
-            try
+            return CompareVersions(local, remote) < 0;
+        }
+
+        /// <summary>比较两个版本号：返回 &lt;0 表示 a 旧于 b，0 相同，&gt;0 表示 a 新于 b。</summary>
+        private static int CompareVersions(string a, string b)
+        {
+            // 拆出主次补丁数字段
+            var ra = Regex.Match(a ?? "", @"^(\d+)\.(\d+)\.(\d+)");
+            var rb = Regex.Match(b ?? "", @"^(\d+)\.(\d+)\.(\d+)");
+            if (!ra.Success || !rb.Success) return string.CompareOrdinal(a, b);
+            for (int i = 1; i <= 3; i++)
             {
-                using var handler = new HttpClientHandler { UseProxy = true };
-                // 显式应用环境变量代理（gh/curl 习惯），未设置则走系统代理
+                int na = int.Parse(ra.Groups[i].Value);
+                int nb = int.Parse(rb.Groups[i].Value);
+                if (na != nb) return na.CompareTo(nb);
+            }
+            // 主次补丁相同，比较 prerelease；无 prerelease 的最新
+            int pa = GetPreReleaseNum(a);
+            int pb = GetPreReleaseNum(b);
+            return pa.CompareTo(pb);
+        }
+
+        /// <summary>取 prerelease 段里的数字（如 -rc.6 → 6）；无 prerelease 返回 int.MaxValue（视为最稳定/最新）。</summary>
+        private static int GetPreReleaseNum(string v)
+        {
+            var pm = Regex.Match(v ?? "", @"-([^.\s]+)(?:\.(\d+))?");
+            if (!pm.Success) return int.MaxValue;
+            // 形如 rc.6 或 beta.3：取最后一段数字
+            var num = Regex.Match(pm.Groups[0].Value, @"(\d+)\s*$");
+            return num.Success ? int.Parse(num.Groups[1].Value) : 0;
+        }
+
+        /// <summary>
+        /// 创建带合理 User-Agent 的 HttpClient（供下载/抓取共用）。
+        /// useProxy=true：走代理（HTTPS_PROXY/HTTP_PROXY 环境变量优先，其次系统代理），没有则直连；
+        /// useProxy=false：强制直连（绕过代理）。
+        /// 注意：某些代理出口 IP 会被 GitHub codeload 限流（429），而直连反而正常，故下载需直连/代理都尝试。
+        /// </summary>
+        internal static HttpClient CreateHttpClient(int timeoutSec, bool useProxy = true)
+        {
+            var handler = new HttpClientHandler { UseProxy = useProxy, AllowAutoRedirect = true };
+            if (useProxy)
+            {
                 string proxy = Environment.GetEnvironmentVariable("HTTPS_PROXY")
                             ?? Environment.GetEnvironmentVariable("https_proxy")
                             ?? Environment.GetEnvironmentVariable("HTTP_PROXY");
@@ -1418,7 +1567,23 @@ namespace DshLauncher
                     handler.Proxy = new System.Net.WebProxy(proxy);
                     handler.UseProxy = true;
                 }
-                using var client = new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(timeoutSec) };
+            }
+            else
+            {
+                handler.UseProxy = false;   // 强制直连
+            }
+            var client = new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(timeoutSec) };
+            client.DefaultRequestHeaders.UserAgent.ParseAdd(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36");
+            return client;
+        }
+
+        /// <summary>带代理感知的短超时抓取；失败返回 null。</summary>
+        private static string TryFetchText(string url, int timeoutSec)
+        {
+            try
+            {
+                using var client = CreateHttpClient(timeoutSec);
                 return client.GetStringAsync(url).GetAwaiter().GetResult();
             }
             catch

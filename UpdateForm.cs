@@ -28,28 +28,37 @@ namespace DshLauncher
     internal class UpdateForm : Form
     {
         private readonly Label _lblInfo = new Label { AutoSize = false, Height = 48 };
-        private readonly Button _btnUpdate = new Button { Text = "立即更新", Width = 110, Height = 30 };
-        private readonly Button _btnSkip = new Button { Text = "跳过（继续使用旧版）", Width = 170, Height = 30 };
+        private readonly Button _btnUpdate = new Button { Text = "立即更新", Width = 96, Height = 30 };
+        private readonly Button _btnSkip = new Button { Text = "跳过", Width = 96, Height = 30 };
+        private readonly Button _btnChoose = new Button { Text = "选择目录", Width = 104, Height = 30 };
+        private readonly Button _btnExit = new Button { Text = "退出", Width = 104, Height = 30 };
         private readonly ProgressBar _progress = new ProgressBar { Minimum = 0, Maximum = 100, Height = 16 };
         private readonly TextBox _log = new TextBox
         {
             Multiline = true, ReadOnly = true, ScrollBars = ScrollBars.Vertical,
             Font = new Font("Consolas", 9f), BackColor = Color.White
         };
-        private readonly Label _step = new Label { AutoSize = false, Height = 22 };
+        private readonly Label _step = new Label { AutoSize = false, Height = 22, Width = 432 };
 
         private readonly string _localVersion;
-        private readonly string _remoteVersion;
+        private string _remoteVersion;
+        private readonly string _knownRemote;   // 已知的新版号（主窗口手动检查传入）；null 表示需自行检查
         private bool _busy;
         private string _node;
 
         /// <summary>更新完成并成功为 true。</summary>
         public bool Completed { get; private set; }
 
+        public UpdateForm(string localVersion) : this(localVersion, null) { }
+
+        /// <summary>
+        /// localVersion 当前版本；remoteVersion 非 null 表示已确认存在新版（主窗口手动检查场景），
+        /// 直接进入「发现新版」界面；为 null 时窗口内自行联网检查（启动时场景，立即显示检查状态）。
+        /// </summary>
         public UpdateForm(string localVersion, string remoteVersion)
         {
             _localVersion = localVersion;
-            _remoteVersion = remoteVersion;
+            _knownRemote = remoteVersion;
             Text = "dsh-launcher 更新";
             Font = new Font("Microsoft YaHei UI", 9.5f);
             ClientSize = new Size(460, 440);
@@ -61,13 +70,17 @@ namespace DshLauncher
 
             _lblInfo.Location = new Point(14, 12);
             _lblInfo.Size = new Size(432, 52);
-            _lblInfo.Text = "发现新版本 " + _remoteVersion + "（本地 " + _localVersion + "）\n" +
-                "更新将覆盖 dsh 源码并重新构建；你自己添加的文件会保留，userdata 数据不受影响。";
+            _lblInfo.Text = "正在检查更新 ...\n本地版本：" + _localVersion;
 
             _btnUpdate.Location = new Point(14, 70);
-            _btnSkip.Location = new Point(134, 70);
+            _btnSkip.Location = new Point(116, 70);
+            _btnChoose.Location = new Point(218, 70);
+            _btnExit.Location = new Point(328, 70);
             _btnUpdate.Click += async (s, e) => await StartUpdateAsync();
             _btnSkip.Click += (s, e) => Close();
+            _btnChoose.Click += (s, e) => ChooseDshDirectory();
+            // 「退出」：直接退出程序，不进入主界面/不启动服务（用于更新失败时快速退出）
+            _btnExit.Click += (s, e) => Application.Exit();
 
             _step.Location = new Point(14, 108);
             _progress.Location = new Point(14, 134);
@@ -78,9 +91,98 @@ namespace DshLauncher
             Controls.Add(_lblInfo);
             Controls.Add(_btnUpdate);
             Controls.Add(_btnSkip);
+            Controls.Add(_btnChoose);
+            Controls.Add(_btnExit);
             Controls.Add(_step);
             Controls.Add(_progress);
             Controls.Add(_log);
+
+            // 初始状态：若已传入已知新版则直接进入「发现新版」；否则进入「检查中」状态。
+            // 检查阶段「跳过」始终可用：用户可随时跳过检查直接进入主窗口（检查仅发 HTTP 读版本号，
+            // 不动源码不启服务，不存在进程互相干扰；窗口关闭后异步检查结果会被 IsDisposed 丢弃）。
+            if (_knownRemote != null)
+            {
+                ApplyCheckResult(_knownRemote);
+            }
+            else
+            {
+                _btnUpdate.Enabled = false;   // 检查未完成前不知道是否有新版，禁用「立即更新」
+                // 检查阶段进度条保持 0（进度条仅用于实际更新过程）
+                SetStep("正在检查更新 ...", _progress.Minimum);
+            }
+        }
+
+        protected override void OnShown(EventArgs e)
+        {
+            base.OnShown(e);
+            if (_knownRemote == null)
+                _ = CheckForUpdatesAsync();   // 后台异步检查，UI 即时响应
+        }
+
+        /// <summary>后台检查是否有新版；完成后更新界面状态。
+        /// 带 15s 总超时：无网络/慢网络时不至于让更新窗口长时间卡住（按检查失败处理，进入主界面）。</summary>
+        private async Task CheckForUpdatesAsync()
+        {
+            string result = null;
+            try
+            {
+                var check = Task.Run(MainForm.CheckVersionRemote);
+                // 若网络不通，多个候选源逐个超时会拖很久；这里限制总等待时长
+                var done = await Task.WhenAny(check, Task.Delay(15000)) == check;
+                if (done) result = await check;
+            }
+            catch
+            {
+                result = null;
+            }
+            if (IsDisposed) return;
+            Invoke((Action)(() => ApplyCheckResult(result)));
+        }
+
+        /// <summary>根据检查结果切换界面：有新版→可更新；无/失败→短暂显示后自动关闭。
+        /// 检查阶段结束即把进度条归零（进度条仅用于实际更新过程），避免“检查时走进度条”的突兀感。</summary>
+        private void ApplyCheckResult(string result)
+        {
+            _progress.Value = _progress.Minimum;   // 检测结束，进度条重置
+            if (result != null && result != "latest")
+            {
+                _remoteVersion = result;
+                _lblInfo.Text = "发现新版本 " + _remoteVersion + "（本地 " + _localVersion + "）\n" +
+                    "更新将覆盖 dsh 源码并重新构建；你自己添加的文件会保留，userdata 数据不受影响。";
+                _btnUpdate.Enabled = true;
+                _btnSkip.Enabled = true;
+                SetStep("发现新版本，可点击「立即更新」", _progress.Minimum);
+                Log("发现新版本：" + result + "（本地 " + _localVersion + "）");
+                return;
+            }
+            // 无新版或检查失败：简短展示结果后自动进入主界面
+            if (result == "latest")
+            {
+                _lblInfo.Text = "已是最新版本（" + _localVersion + "）。";
+                SetStep("已是最新版本，即将进入主界面 ...", _progress.Minimum);
+            }
+            else
+            {
+                _lblInfo.Text = "无法检查更新（网络或仓库不可达）。\n可稍后展开操作栏「检查更新」重试。";
+                SetStep("检查失败，即将进入主界面 ...", _progress.Minimum);
+            }
+            Log(_lblInfo.Text);
+            // 短暂停留，让用户看到检查结果，再自动关闭进入主界面
+            var t = new System.Windows.Forms.Timer { Interval = 1200 };
+            t.Tick += (s2, e2) => { t.Stop(); Close(); };
+            t.Start();
+        }
+
+        /// <summary>选择并切换 dsh 源码目录（更新窗口内手动指定，供用户自行更新后指向新目录）。</summary>
+        private void ChooseDshDirectory()
+        {
+            string path = MainForm.SelectAndSetDshDirectory(this);
+            if (path == null) return;   // 用户取消或目录无效
+            _lblInfo.Text = "已选择 dsh 源码目录：\n" + path;
+            SetStep("本地版本：" + MainForm.LocalVersion, 5);
+            Log("已选择 dsh 源码目录：" + path);
+            // 重新检查更新（指向新目录后版本可能不同）
+            _ = CheckForUpdatesAsync();
         }
 
         private async Task StartUpdateAsync()
@@ -102,6 +204,8 @@ namespace DshLauncher
                     catch (Exception ex)
                     {
                         Log("更新失败：" + ex.Message);
+                        // 失败时进度条复位，避免停在中间值造成“仍在尝试”的错觉
+                        _progress.Value = _progress.Minimum;
                         var r = MessageBox.Show(
                             "更新失败：" + ex.Message + "\n\n" +
                             "【重试】重新执行整个更新流程\n【取消】放弃本次更新\n\n" +
@@ -157,24 +261,35 @@ namespace DshLauncher
                 SetStep("下载最新源码 ...", 15);
                 string zipPath = Path.Combine(MainForm.LauncherDir, "dsh-update.zip");
                 bool downloaded = false;
+                // 单轮尝试所有源（直连 → 走代理）。GitHub 限流（429/502）失败后由用户决定是否重试，
+                // 通过外层 StartUpdateAsync 的「重试/取消」弹窗触发，不自动循环。
                 foreach (var url in MainForm.SourceZipMirrors)
                 {
-                    Log("下载：" + url);
-                    try
+                    foreach (bool useProxy in new[] { false, true })
                     {
-                        using (var client = new HttpClient { Timeout = TimeSpan.FromMinutes(15) })
-                        using (var fs = new FileStream(zipPath, FileMode.Create, FileAccess.Write, FileShare.None))
+                        Log("下载：" + url + (useProxy ? "（走代理）" : "（直连）"));
+                        try
                         {
-                            var resp = await client.GetAsync(url, HttpCompletionOption.ResponseHeadersRead);
-                            if (!resp.IsSuccessStatusCode) { Log("HTTP " + (int)resp.StatusCode + "，尝试下一源 ..."); continue; }
-                            await resp.Content.CopyToAsync(fs);
+                            using (var client = MainForm.CreateHttpClient(900, useProxy))
+                            using (var fs = new FileStream(zipPath, FileMode.Create, FileAccess.Write, FileShare.None))
+                            {
+                                var resp = await client.GetAsync(url, HttpCompletionOption.ResponseHeadersRead);
+                                if (!resp.IsSuccessStatusCode)
+                                {
+                                    Log("HTTP " + (int)resp.StatusCode + "，尝试下一方式/源 ...");
+                                    continue;
+                                }
+                                await resp.Content.CopyToAsync(fs);
+                            }
+                            downloaded = true;
+                            Log("下载成功：" + url);
+                            break;
                         }
-                        downloaded = true;
-                        break;
+                        catch (Exception ex) { Log("下载异常：" + ex.Message + "，尝试下一方式/源 ..."); }
                     }
-                    catch (Exception ex) { Log("下载异常：" + ex.Message + "，尝试下一源 ..."); }
+                    if (downloaded) break;
                 }
-                if (!downloaded) throw new Exception("下载最新源码失败（所有下载源不可用）");
+                if (!downloaded) throw new Exception("下载最新源码失败（所有下载源均不可用）");
 
                 // 替换前确认：告知会覆盖同名文件，用户自有文件建议先手动备份
                 var warn = MessageBox.Show(
@@ -205,6 +320,14 @@ namespace DshLauncher
             SetStep("安装依赖（pnpm install）...", 60);
             if (!await RunProcessAsync(_node, "\"" + pnpm + "\" install", MainForm.WorkDir, 1800))
                 throw new Exception("依赖安装失败（pnpm install）");
+
+            // 补装 tsdown 的 optional peer 依赖 unrun（dsh 的 pnpm run build 依赖它，
+            // 但 pnpm 默认不装 optional peer，干净环境直接 build 会报 Failed to import module "unrun"）。
+            // 幂等：已装则跳过；失败不阻断（若 build 确需它，下面 build 会给出明确错误）。
+            SetStep("补装构建依赖（unrun）...", 70);
+            if (!await RunProcessAsync(_node, "\"" + pnpm + "\" add -Dw unrun", MainForm.WorkDir, 600))
+                Log("补装 unrun 失败（忽略，继续构建）。");
+
             SetStep("构建（pnpm run build）...", 85);
             if (!await RunProcessAsync(_node, "\"" + pnpm + "\" run build", MainForm.WorkDir, 1800))
                 throw new Exception("构建失败（pnpm run build）");
@@ -455,10 +578,18 @@ namespace DshLauncher
         private void SetStep(string text, int percent)
         {
             if (IsDisposed) return;
+            int v = Math.Max(_progress.Minimum, Math.Min(_progress.Maximum, percent));
+            if (!IsHandleCreated)
+            {
+                // 窗口句柄尚未创建（如构造函数阶段）：直接赋值，避免 Invoke 抛异常
+                _step.Text = text;
+                _progress.Value = v;
+                return;
+            }
             Invoke((Action)(() =>
             {
                 _step.Text = text;
-                _progress.Value = Math.Max(_progress.Minimum, Math.Min(_progress.Maximum, percent));
+                _progress.Value = v;
             }));
         }
 

@@ -10,6 +10,7 @@ home/
 home-fresh/
 dsh-home/
 backups/
+.workbuddy/
 config.json
 
 # ---- 程序与构建产物 ----
@@ -30,6 +31,7 @@ webview-data*/
 
 # ---- 下载 / 解压临时文件 ----
 dsh-source.zip
+dsh-update.zip
 dsh-extract/
 
 # ---- 启动画面图库（图片多为网上收集，存在版权风险，发布时排除）----
