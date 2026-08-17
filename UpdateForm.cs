@@ -260,11 +260,11 @@ namespace DshLauncher
                     "($_.CommandLine -match [regex]::Escape('" + wd + "')) -or " +
                     "($_.CommandLine -match 'apps[\\/]cli[\\/]src[\\/]bin\\.ts') " +
                     "} | ForEach-Object { [string]$_.ProcessId + '|' + $_.Name }";
-                foreach (var line in RunPowershellCapture(script))
+                foreach (var line in RunPowershellCapture(script, out int psPid))
                 {
                     var kv = line.Split('|');
                     if (kv.Length >= 2 && int.TryParse(kv[0], out int pidNum) && pidNum > 0
-                        && pidNum != Environment.ProcessId && !pids.Contains(pidNum))
+                        && pidNum != Environment.ProcessId && pidNum != psPid && !pids.Contains(pidNum))
                     {
                         pids.Add(pidNum);
                         names.Add(kv[1] + "（PID " + pidNum + "，指向 " + MainForm.WorkDir + "）");
@@ -303,9 +303,10 @@ namespace DshLauncher
             return true;
         }
 
-        /// <summary>执行一段 PowerShell 脚本并返回逐行输出；失败返回空列表。</summary>
-        private List<string> RunPowershellCapture(string script)
+        /// <summary>执行一段 PowerShell 脚本并返回逐行输出；失败返回空列表。selfPid 返回本次启动的 powershell 进程 ID（查询本身会匹配到自己，需在结果中排除）。</summary>
+        private List<string> RunPowershellCapture(string script, out int selfPid)
         {
+            selfPid = 0;
             var result = new List<string>();
             try
             {
@@ -322,6 +323,7 @@ namespace DshLauncher
                 };
                 using var p = Process.Start(psi);
                 if (p == null) return result;
+                selfPid = p.Id;
                 string output = p.StandardOutput.ReadToEnd();
                 p.WaitForExit(20000);
                 foreach (var line in output.Split('\n'))
@@ -336,21 +338,49 @@ namespace DshLauncher
 
         // ── 文件级合并覆盖 ────────────────────────────────────────
 
-        /// <summary>把 newRoot 下的源码文件级合并覆盖到 WorkDir；返回 false = 用户取消。</summary>
+        /// <summary>把 newRoot 下的源码文件级合并覆盖到 WorkDir；返回 false = 用户取消。
+        /// 合并（清理残留 + 逐个覆盖）在后台线程执行，避免更新窗口卡成「无响应」。</summary>
         private async Task<bool> MergeNewSourceAsync(string newRoot)
         {
             string workDir = MainForm.WorkDir;
             Directory.CreateDirectory(workDir);
 
-            // 1) 同步清理：仅新包顶层存在的目录内，删除新包中不存在的残留文件（跳过 node_modules）。
-            //    顶层不在新包中的目录（node_modules、_launcher_build*、.agents 等）一律不动。
+            // 耗时操作放后台线程：本机源码目录体量很大（node_modules 内含大量 pnpm 联接），
+            // 且逐文件覆盖受杀软实时扫描影响，同步执行会把更新窗口卡成「无响应」。
+            var failed = await Task.Run(() => MergeNewSourceCore(newRoot, workDir));
+
+            if (failed.Count > 0)
+            {
+                string list = string.Join("\n", failed.Take(6));
+                var r = MessageBox.Show(
+                    "以下文件被其他进程占用，重试后仍无法更新：\n\n" + list +
+                    (failed.Count > 6 ? "\n…共 " + failed.Count + " 个" : "") +
+                    "\n\n【是】跳过这些文件继续\n【否】取消更新",
+                    "文件被占用", MessageBoxButtons.YesNo, MessageBoxIcon.Warning);
+                if (r != DialogResult.Yes)
+                {
+                    Log("用户取消更新（文件被占用）。");
+                    return false;
+                }
+                Log("已跳过 " + failed.Count + " 个被占用文件。");
+            }
+            return true;
+        }
+
+        /// <summary>后台线程执行的合并：先清理残留（剪枝 node_modules/.git），再逐文件覆盖（占用自动重试）。</summary>
+        private List<string> MergeNewSourceCore(string newRoot, string workDir)
+        {
+            var failed = new List<string>();
+
+            // 1) 同步清理：仅新包顶层存在的目录内，删除新包中不存在的残留文件。
+            //    手动递归并在 node_modules/.git 处剪枝——这些目录含 pnpm 联接（符号链接），
+            //    SearchOption.AllDirectories 会跟随联接遍历整个依赖图，导致卡死甚至死循环。
             try { DeleteStaleFiles(newRoot, workDir); }
             catch (Exception ex) { Log("清理残留文件失败（忽略）：" + ex.Message); }
 
             // 2) 逐个文件覆盖；被占用文件自动重试，仍失败则报告具体路径
             var files = Directory.GetFiles(newRoot, "*", SearchOption.AllDirectories);
             var queue = new Queue<string>(files);
-            var failed = new List<string>();
             int attempt = 0;
             while (queue.Count > 0 && attempt < 5)
             {
@@ -382,29 +412,14 @@ namespace DshLauncher
                 if (queue.Count > 0)
                 {
                     Log("仍有 " + queue.Count + " 个文件被占用，2 秒后重试（第 " + attempt + " 次）...");
-                    await Task.Delay(2000);
+                    System.Threading.Thread.Sleep(2000);
                 }
             }
-
-            if (failed.Count > 0)
-            {
-                string list = string.Join("\n", failed.Take(6));
-                var r = MessageBox.Show(
-                    "以下文件被其他进程占用，重试后仍无法更新：\n\n" + list +
-                    (failed.Count > 6 ? "\n…共 " + failed.Count + " 个" : "") +
-                    "\n\n【是】跳过这些文件继续\n【否】取消更新",
-                    "文件被占用", MessageBoxButtons.YesNo, MessageBoxIcon.Warning);
-                if (r != DialogResult.Yes)
-                {
-                    Log("用户取消更新（文件被占用）。");
-                    return false;
-                }
-                Log("已跳过 " + failed.Count + " 个被占用文件。");
-            }
-            return true;
+            return failed;
         }
 
-        /// <summary>删除旧目录中「新包顶层目录内且新包已不存在的」残留文件；跳过 node_modules。</summary>
+        /// <summary>删除旧目录中「新包顶层目录内且新包已不存在的」残留文件。
+        /// 手动递归并在 node_modules/.git 处剪枝（pnpm 联接/符号链接不可遍历）。</summary>
         private static void DeleteStaleFiles(string newRoot, string workDir)
         {
             foreach (var newTop in Directory.GetDirectories(newRoot))
@@ -415,22 +430,26 @@ namespace DshLauncher
                 var newFiles = Directory.GetFiles(newTop, "*", SearchOption.AllDirectories)
                     .Select(f => Path.GetRelativePath(newTop, f))
                     .ToHashSet(StringComparer.OrdinalIgnoreCase);
-                foreach (var oldFile in Directory.GetFiles(oldTop, "*", SearchOption.AllDirectories))
-                {
-                    string rel = Path.GetRelativePath(oldTop, oldFile);
-                    if (IsUnderNodeModules(rel)) continue;
-                    if (newFiles.Contains(rel)) continue;
-                    try { File.Delete(oldFile); }
-                    catch { /* 被占用/只读则跳过，不影响整体 */ }
-                }
+                DeleteStaleRecursive(oldTop, oldTop, newFiles);
             }
         }
 
-        private static bool IsUnderNodeModules(string rel)
+        private static void DeleteStaleRecursive(string oldTop, string current, HashSet<string> keepRel)
         {
-            foreach (var seg in rel.Split(new[] { '\\', '/' }))
-                if (seg.Equals("node_modules", StringComparison.OrdinalIgnoreCase)) return true;
-            return false;
+            foreach (var file in Directory.GetFiles(current))
+            {
+                string rel = Path.GetRelativePath(oldTop, file);
+                if (keepRel.Contains(rel)) continue;
+                try { File.Delete(file); }
+                catch { /* 被占用/只读则跳过，不影响整体 */ }
+            }
+            foreach (var sub in Directory.GetDirectories(current))
+            {
+                string name = Path.GetFileName(sub);
+                if (name.Equals("node_modules", StringComparison.OrdinalIgnoreCase)) continue;
+                if (name.Equals(".git", StringComparison.OrdinalIgnoreCase)) continue;
+                DeleteStaleRecursive(oldTop, sub, keepRel);
+            }
         }
 
         private void SetStep(string text, int percent)
