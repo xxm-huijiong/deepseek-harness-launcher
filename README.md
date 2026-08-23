@@ -1,16 +1,24 @@
 # DeepSeek Harness 桌面启动器
 
-一个把 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（dsh）Web 界面包装成桌面软件的一键启动器（Windows）。
+把 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（dsh）包装成 Windows 桌面软件的一键启动器。dsh 本身需要安装 Node.js、pnpm、下载源码、手动启动，门槛较高；本启动器把这些步骤全部自动化，双击即可使用。
 
-- 内置 WebView2 浏览器，打开即桌面软件外观；**Runtime 缺失时自动下载静默安装**，操作栏可手动「修复浏览器」
-- 一键启动/停止服务，自动打开 dsh 界面
-- 首次使用自动引导：自动下载 dsh 源码（支持国内镜像）或手动选择已有目录
-- 端口占用自动检测、加载失败自动重试
-- **任务提醒**：回合级任务完成/失败/取消气泡提醒（按回合结束判定、过滤子代理会话，可选「后台才提醒」）
-- 关闭窗口自动缩到系统托盘，服务持续后台运行（右键托盘可操作/退出）
-- 用户数据独立存放（`userdata` 目录），更新/重装不丢失，支持一键备份
-- **一键更新**：文件级合并覆盖、保留你自行添加的文件、替换前二次确认、占用进程自动清理、失败可重试
-- **全部路径以启动器所在文件夹为根，放任意盘符/目录均可使用**
+## 功能特性
+
+* 全自动安装：首次运行只需一个exe文件（大小仅1M多），自动从 GitHub 下载dsh 源码（可选国内镜像加速）、解压并全自动安装所有的依赖环境。或手动选择已有目录。
+* 内置 WebView2 浏览器，打开即桌面软件外观；Runtime 缺失时自动下载静默安装，操作栏可手动「修复浏览器」
+* 一键启动/停止服务，自动打开 dsh 界面
+* 端口占用自动检测、加载失败自动重试
+* 任务提醒：原版dsh在任务完成时没有消息通知，本启动器添加了选项，可在对话任务完成、失败、取消时、弹出窗口等待用户选择时，在系统右下角弹出气泡通知，及时提醒用户查看。可选「后台才提醒」，在窗口未激活时才发消息提醒。
+* 关闭窗口自动缩到系统托盘，服务持续后台运行（右键托盘可操作/退出）
+* 自动更新：启动时自动检查 dsh 官方新版本并更新。更新采用文件级合并覆盖，自行添加或修改的文件会保留，用户聊天记录与数据不受影响。
+* 用户数据独立存放（`userdata` 目录），更新/重装不丢失，支持一键备份。
+* 全部路径以启动器所在文件夹为根，放任意盘符/目录均可使用，无需安装。
+
+## 快速使用
+
+- **首次使用**：双击 exe → 自动下载DSH安装（或选已有目录）→ 自动启动 → 开始对话
+- **日常使用**：双击 exe → 自动检查DSH更新 → 自动启动服务 → 打开即用
+- **结束后台**：关窗口进托盘，服务继续运行；托盘右键「退出」才真正停止 
 
 ---
 
@@ -19,9 +27,11 @@
 **方式一：下载现成的编译产物（推荐，无需编译环境）**
 
 前往本仓库的 **Releases** 页面下载最新版：
+
 ```
 https://github.com/xxm-huijiong/deepseek-harness-launcher/releases
 ```
+
 下载 `dsh-launcher.exe`（框架依赖版，约 1.6MB；需目标机装有 .NET 7 Desktop Runtime）或 `dsh-launcher-standalone.exe`（自包含版，约 150MB，免装 .NET）。
 运行前先确认已满足「环境要求」（.NET 7 Desktop Runtime / WebView2 / Node.js / pnpm；WebView2 缺失时启动器会自动下载安装）。
 
@@ -35,12 +45,12 @@ https://github.com/xxm-huijiong/deepseek-harness-launcher/releases
 
 **第一步：安装运行环境**（Windows 不自带，需手动安装一次）
 
-| 依赖 | 作用 | 下载 |
-|---|---|---|
-| .NET 7 Desktop Runtime | 运行启动器本体 | https://dotnet.microsoft.com/download/dotnet/7.0 |
-| WebView2 Runtime | 内置浏览器内核 | Win11 自带；缺失时启动器会**自动下载并静默安装**（约 2MB，无需管理员），也可点「修复浏览器」手动安装 |
-| Node.js ≥ 22.19 | 运行 dsh 服务 | https://nodejs.org |
-| pnpm | 安装 dsh 依赖 | 装完 Node 后执行 `npm install -g pnpm` |
+| 依赖                     | 作用        | 下载                                                        |
+| ---------------------- | --------- | --------------------------------------------------------- |
+| .NET 7 Desktop Runtime | 运行启动器本体   | https://dotnet.microsoft.com/download/dotnet/7.0          |
+| WebView2 Runtime       | 内置浏览器内核   | Win11 自带；缺失时启动器会**自动下载并静默安装**（约 2MB，无需管理员），也可点「修复浏览器」手动安装 |
+| Node.js ≥ 22.19        | 运行 dsh 服务 | https://nodejs.org                                        |
+| pnpm                   | 安装 dsh 依赖 | 装完 Node 后执行 `npm install -g pnpm`                         |
 
 **第二步：打开启动器**
 
@@ -61,12 +71,15 @@ https://github.com/xxm-huijiong/deepseek-harness-launcher/releases
 官方支持两种运行方式（详见 dsh 官方 [README](https://github.com/deepseek-ai/deepseek-harness)）：
 
 **方式一：npm 直装（只需 Node.js）**
+
 ```sh
 npx @deepseek-ai/dsh web
 ```
+
 启动后 Web UI 默认在 `http://127.0.0.1:3080`。
 
 **方式二：源码运行（完整功能，可二次开发）**
+
 ```sh
 git clone https://github.com/deepseek-ai/deepseek-harness.git
 cd deepseek-harness
@@ -83,23 +96,24 @@ pnpm dsh web
 
 **注意：.NET SDK 不是 Windows 自带的**，需要先安装：
 
-| 项 | 说明 |
-|---|---|
+| 项          | 说明                                                             |
+| ---------- | -------------------------------------------------------------- |
 | .NET 7 SDK | 下载：https://dotnet.microsoft.com/download/dotnet/7.0 （含编译与运行所需） |
-| 验证 | 命令行执行 `dotnet --version`，能输出版本号即可 |
+| 验证         | 命令行执行 `dotnet --version`，能输出版本号即可                              |
 
 **一键编译**：源码目录下有 `build.bat`，支持两种发布模式：
 
-| 命令 | 产物 | 说明 |
-|---|---|---|
-| `build.bat` | `dsh-launcher.exe`（约 1.6MB） | 框架依赖版：目标机需已装 .NET 7 Desktop Runtime |
-| `build.bat self` | `dsh-launcher-standalone.exe`（约 150MB） | 自包含版：内置 .NET 运行时，免装即可运行（适合全新虚拟机） |
+| 命令               | 产物                                     | 说明                                  |
+| ---------------- | -------------------------------------- | ----------------------------------- |
+| `build.bat`      | `dsh-launcher.exe`（约 1.6MB）            | 框架依赖版：目标机需已装 .NET 7 Desktop Runtime |
+| `build.bat self` | `dsh-launcher-standalone.exe`（约 150MB） | 自包含版：内置 .NET 运行时，免装即可运行（适合全新虚拟机）    |
 
 > **运行入口永远是源码根目录下的 `dsh-launcher.exe`**；
 > `bin\Release\net7.0-windows\win-x64\DshLauncher.exe`（约 350KB）只是中间构建产物，不能直接运行。
 > 若复制报"文件被占用"，先关闭正在运行的启动器再编译。
 
 **手动命令**（等价于 build.bat 默认模式）：
+
 ```bash
 cd <启动器目录>
 dotnet publish -c Release -r win-x64 --self-contained false -p:PublishSingleFile=true

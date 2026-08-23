@@ -93,7 +93,9 @@ namespace DshLauncher
         };
 
         private const int Port = 3080;
-        private const string UiUrl = @"http://127.0.0.1:3080/web/";
+        // dsh 的 Web UI 路径随版本变化：旧版在 /web/，新版（0.1.1+）在根路径 /。
+        // 启动时通过 ProbeUiPath 探测，兼容新旧版本；此字段后续会被探测结果覆盖。
+        private static string UiUrl = @"http://127.0.0.1:3080/";
 
         // 布局常量
         private const int StatusBarHeight = 22;   // 底部状态条
@@ -107,6 +109,8 @@ namespace DshLauncher
             @"D:\nodejs\node.exe"                                                      // 回退
         };
         private const string PnpmCjs = @"D:\npm-global\node_modules\pnpm\bin\pnpm.cjs"; // 本机回退路径
+        // 启动器自管理的 node（免安装 zip 解压到 LauncherDir\node），优先使用以规避 node22 的 import.meta.main 问题
+        internal static readonly string ManagedNodeDir = Path.Combine(LauncherDir, "node");
 
         // ── 控件 ──────────────────────────────────────────────────
         private Panel _statusBar;            // 底部状态条
@@ -224,6 +228,8 @@ namespace DshLauncher
             trayMenu.Items.Add(_menuBackOnly);
 
             trayMenu.Items.Add(new ToolStripSeparator());
+            trayMenu.Items.Add("升级 Node.js 到 v24", null, (s, e) => _ = TryUpgradeNodeAsync());
+            trayMenu.Items.Add(new ToolStripSeparator());
             trayMenu.Items.Add("退出", null, (s, e) => ExitApp());
             _trayIcon.ContextMenuStrip = trayMenu;
             _trayIcon.DoubleClick += (s, e) => ShowMainWindow();
@@ -275,7 +281,7 @@ namespace DshLauncher
             _actionsPanel.Controls.Add(_btnCheck = MakeActionButton("检查更新", 492, 10, (x) => CheckForUpdates(interactive: true)));
             _actionsPanel.Controls.Add(_btnWebView = MakeActionButton("修复浏览器", 588, 10, (x) => _ = TryInstallWebView2Async()));
             _actionsPanel.Controls.Add(_btnChooseDir = MakeActionButton("选择 dsh 目录", 684, 10, (x) => ChooseDshDirectoryFromMain(), 104));
-            _actionsPanel.Controls.Add(_btnExit = MakeActionButton("退出", 792, 10, (x) => ExitApp()));
+            _actionsPanel.Controls.Add(_btnExit = MakeActionButton("退出", 800, 10, (x) => ExitApp()));
             // 第二行：复选框（独立一行，文字空间充裕）
             _actionsPanel.Controls.Add(_chkAutoStart = new CheckBox
             {
@@ -466,6 +472,33 @@ namespace DshLauncher
                 _ = StartServerAsync();
 
             // 启动时检查更新已移至主程序入口（前置更新窗口）处理
+
+            // 检测 node 版本：若 < v24，提示可自动升级（dsh 0.1.1+ 构建依赖 node24 的 import.meta.main）
+            CheckNodeVersionAndSuggest();
+        }
+
+        /// <summary>后台检测当前 node 版本；若 &lt; v24 则提示用户可自动升级（不影响现有启动流程）。</summary>
+        private async void CheckNodeVersionAndSuggest()
+        {
+            try
+            {
+                string node = await Task.Run(FindNode);
+                if (node == null) return;   // 无 node，不打扰（安装向导会处理）
+                string ver = await Task.Run(() => NodeVersion(node));
+                if (ver == null) return;
+                if (MajorOf(ver) >= 24) return;   // 已是 node24+，无需提示
+                // node22 等：提示可升级（后台延迟，避免挤占启动流程）
+                await Task.Delay(1500);
+                if (IsDisposed) return;
+                var r = MessageBox.Show(
+                    "当前 Node.js：" + ver + "（&lt; v24）。\n\n" +
+                    "dsh 0.1.1+ 的构建在 node v22 下可能静默失败（import.meta.main 不生效）。\n" +
+                    "是否自动升级到 node v24（免安装版，不改系统环境变量）？",
+                    "建议升级 Node.js", MessageBoxButtons.YesNo, MessageBoxIcon.Question);
+                if (r == DialogResult.Yes)
+                    await TryUpgradeNodeAsync();
+            }
+            catch { }
         }
 
         private void OnFormClosing(object sender, FormClosingEventArgs e)
@@ -558,18 +591,25 @@ namespace DshLauncher
                 }
 
                 // 2) 本启动器拉起服务
-                string node = FindNode();
+                string node = FindManagedNode() ?? FindNode();
                 if (node == null) { Log("错误：未找到可用的 node（需要 ≥ v22.19，请安装 Node.js）。"); return; }
-                string pnpm = FindPnpm();
-                if (pnpm == null) { Log("错误：未找到 pnpm（请先执行 npm install -g pnpm）。"); return; }
 
                 try
                 {
+                    // npm 包方式运行 dsh：优先用自管理 node 24 执行全局 dsh 包的 bin.js（无需源码构建）
+                    string dshCli = await EnsureDshInstalledAsync(this, Log);
+                    if (string.IsNullOrEmpty(dshCli))
+                    {
+                        Log("未找到全局 dsh 包，无法启动。请先在托盘菜单「升级 Node.js」后启动，或自动安装 dsh。");
+                        SetUiRunning(false, managed: true);
+                        return;
+                    }
+                    node = FindManagedNode() ?? node;   // 优先 node 24 运行
                     var psi = new ProcessStartInfo
                     {
                         FileName = node,
-                        Arguments = "\"" + pnpm + "\" dsh web",
-                        WorkingDirectory = WorkDir,
+                        Arguments = "\"" + dshCli + "\" web",
+                        WorkingDirectory = LauncherDir,
                         UseShellExecute = false,
                         RedirectStandardOutput = true,
                         RedirectStandardError = true,
@@ -580,7 +620,7 @@ namespace DshLauncher
                     // 用户数据统一收敛到 D:\dsh-launcher\userdata（必要时从旧目录自动迁移）
                     EnsureHomeMigrated();
                     psi.Environment["DSH_HOME"] = DshHomeDir;
-                    // 清掉外部注入的“安全删除”钩子，避免 pnpm 清理临时文件时报 trash 失败
+                    // 清掉外部注入的“安全删除”钩子
                     psi.Environment["NODE_OPTIONS"] = "--use-system-ca";
 
                     _managedServer = new Process { StartInfo = psi, EnableRaisingEvents = true };
@@ -595,7 +635,8 @@ namespace DshLauncher
                     Log("正在启动 dsh web（node " + NodeVersion(node) + "，DSH_HOME=" + DshHomeDir + "）...");
                     SetUiRunning(true, managed: true);
 
-                    // 3) 等待 HTTP + WebSocket 双重就绪
+                    // 3) 探测 Web UI 实际路径（新/旧版 dsh 不同），再等待 HTTP + WebSocket 双重就绪
+                    await ProbeUiPath();
                     bool ready = await WaitReadyAsync(90);
                     if (ready)
                     {
@@ -798,6 +839,26 @@ namespace DshLauncher
             {
                 return ProbeState.Idle;
             }
+        }
+
+        /// <summary>探测 dsh Web UI 实际路径（新版在根路径 /，旧版在 /web/），更新 UiUrl 以便加载正确页面。</summary>
+        private async Task ProbeUiPath()
+        {
+            string[] candidates = {
+                @"http://127.0.0.1:3080/",
+                @"http://127.0.0.1:3080/web/"
+            };
+            foreach (var url in candidates)
+            {
+                try
+                {
+                    using var resp = await _http.GetAsync(url);
+                    if (resp.IsSuccessStatusCode) { UiUrl = url; return; }
+                }
+                catch { /* 服务未就绪，尝试下一个 */ }
+            }
+            // 都不可达：保持默认（新版根路径）
+            UiUrl = candidates[0];
         }
 
         private async Task<bool> IsHttpReadyAsync()
@@ -1013,6 +1074,9 @@ namespace DshLauncher
 
         internal static string FindNode()
         {
+            // 0) 启动器自管理的 node（LauncherDir\node\node-v*/node.exe，优先 node 24+；无则取版本 OK 的）
+            string managed = FindManagedNode();
+            if (managed != null) return managed;
             // 1) PATH 中查找 node（开源环境的主要途径）
             string pathNode = ResolveFromPath("node");
             if (pathNode != null)
@@ -1034,6 +1098,37 @@ namespace DshLauncher
                 else best ??= c;
             }
             return best ?? fallback;
+        }
+
+        /// <summary>在自管理 node 目录里找 node.exe；优先版本 ≥24（规避 node22 的 import.meta.main 问题），否则取版本 OK 的。</summary>
+        internal static string FindManagedNode()
+        {
+            try
+            {
+                if (!Directory.Exists(ManagedNodeDir)) return null;
+                string candidate24 = null, fallback = null;
+                foreach (var dir in Directory.GetDirectories(ManagedNodeDir, "node-v*"))
+                {
+                    string exe = Path.Combine(dir, "node.exe");
+                    if (!File.Exists(exe)) continue;
+                    string ver = NodeVersion(exe);
+                    if (ver == null) continue;
+                    if (IsVersionOk(ver))
+                    {
+                        if (MajorOf(ver) >= 24) return exe;      // node 24+ 最优
+                        fallback ??= exe;
+                    }
+                    else candidate24 ??= exe;
+                }
+                return fallback ?? candidate24;
+            }
+            catch { return null; }
+        }
+
+        private static int MajorOf(string version)
+        {
+            var m = Regex.Match(version ?? "", @"v(\d+)");
+            return m.Success ? int.Parse(m.Groups[1].Value) : 0;
         }
 
         internal static string FindPnpm()
@@ -1090,6 +1185,126 @@ namespace DshLauncher
             }
             catch { }
             return null;
+        }
+
+        /// <summary>获取 npm 全局前缀目录（dsh 全局包安装位置）；失败返回 null。</summary>
+        internal static string FindNpmGlobalPrefix(string nodeExe)
+        {
+            try
+            {
+                string npmCli = Path.Combine(Path.GetDirectoryName(nodeExe), "node_modules", "npm", "bin", "npm-cli.js");
+                if (!File.Exists(npmCli)) return null;
+                var p = Process.Start(new ProcessStartInfo
+                {
+                    FileName = nodeExe,
+                    Arguments = "\"" + npmCli + "\" prefix -g",
+                    UseShellExecute = false,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    CreateNoWindow = true
+                });
+                if (p == null) return null;
+                string o = p.StandardOutput.ReadToEnd().Trim();
+                p.WaitForExit(8000);
+                return string.IsNullOrEmpty(o) ? null : o;
+            }
+            catch { return null; }
+        }
+
+        /// <summary>定位全局安装的 dsh 包运行入口（node_modules/@deepseek-ai/dsh/lib/bin.js）；未安装返回 null。</summary>
+        internal static string FindDshCli()
+        {
+            try
+            {
+                // 优先从自管理 node 的全局前缀定位
+                foreach (var node in new[] { FindManagedNode(), FindNode() })
+                {
+                    if (node == null) continue;
+                    string prefix = FindNpmGlobalPrefix(node);
+                    if (string.IsNullOrEmpty(prefix)) continue;
+                    string p = Path.Combine(prefix, "node_modules", "@deepseek-ai", "dsh", "lib", "bin.js");
+                    if (File.Exists(p)) return p;
+                }
+                // 回退：从 PATH 的 dsh.cmd 所在目录的 node_modules 定位
+                string dshCmd = ResolveFromPath("dsh.cmd");
+                if (dshCmd != null)
+                {
+                    string p = Path.Combine(Path.GetDirectoryName(dshCmd), "node_modules", "@deepseek-ai", "dsh", "lib", "bin.js");
+                    if (File.Exists(p)) return p;
+                }
+            }
+            catch { }
+            return null;
+        }
+
+        /// <summary>确保全局已安装 @deepseek-ai/dsh（用自管理 node 执行 npm install -g）；返回 dsh cli 入口，失败返回 null。</summary>
+        internal static async Task<string> EnsureDshInstalledAsync(IWin32Window owner, Action<string> log)
+        {
+            string dsh = FindDshCli();
+            if (dsh != null) return dsh;
+            string node = FindManagedNode() ?? FindNode();
+            if (node == null)
+            {
+                MessageBox.Show(owner, "未找到可用的 Node.js，请先在托盘菜单「升级 Node.js 到 v24」安装。",
+                    "缺少 Node.js", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return null;
+            }
+            var r = MessageBox.Show(owner,
+                "未检测到全局 dsh 包，是否自动安装？\n\n" +
+                "将执行：npm install -g @deepseek-ai/dsh\n（安装到全局目录，联网下载，耗时约 1-2 分钟）",
+                "安装 dsh", MessageBoxButtons.YesNo, MessageBoxIcon.Question);
+            if (r != DialogResult.Yes) return null;
+
+            string npmCli = Path.Combine(Path.GetDirectoryName(node), "node_modules", "npm", "bin", "npm-cli.js");
+            string prefix = FindNpmGlobalPrefix(node);
+            try
+            {
+                log?.Invoke("正在安装 dsh（npm install -g @deepseek-ai/dsh）...");
+                // 用当前进程的 node（而非临时 pnpm）执行 npm，避免全局目录被沙箱/旧 node 干扰
+                var psi = new ProcessStartInfo
+                {
+                    FileName = node,
+                    Arguments = "\"" + npmCli + "\" install -g @deepseek-ai/dsh",
+                    UseShellExecute = false,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    CreateNoWindow = true
+                };
+                if (prefix != null) psi.Environment["npm_config_prefix"] = prefix;
+                psi.Environment["NODE_OPTIONS"] = "--use-system-ca";
+                var proc = Process.Start(psi);
+                if (proc == null) return null;
+                // 事件异步读取 stdout/stderr：避免 ReadToEndAsync 与管道缓冲导致死锁，且能实时输出进度
+                proc.OutputDataReceived += (s, e) => { if (!string.IsNullOrEmpty(e.Data)) log?.Invoke(e.Data); };
+                proc.ErrorDataReceived += (s, e) => { if (!string.IsNullOrEmpty(e.Data)) log?.Invoke("[err] " + e.Data); };
+                proc.BeginOutputReadLine();
+                proc.BeginErrorReadLine();
+                // 超时保护：npm install 最长等 5 分钟，超时判失败，避免无限卡住
+                bool exited = await Task.Run(() => proc.WaitForExit(5 * 60 * 1000));
+                if (!exited)
+                {
+                    try { proc.Kill(); } catch { }
+                    throw new Exception("npm install -g @deepseek-ai/dsh 超时（5 分钟未完成）。可能是网络问题，请重试或手动安装。");
+                }
+                proc.WaitForExit();
+                if (proc.ExitCode != 0)
+                {
+                    throw new Exception("npm install -g @deepseek-ai/dsh 失败（退出码 " + proc.ExitCode + "）。请查看上方日志或手动执行该命令。");
+                }
+                dsh = FindDshCli();
+                if (dsh == null)
+                {
+                    throw new Exception("dsh 已安装但未找到运行入口，请检查全局 npm 目录。");
+                }
+                log?.Invoke("dsh 安装完成。");
+                return dsh;
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(owner, "安装 dsh 失败：\n" + ex.Message,
+                    "安装失败", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return null;
+            }
         }
 
         internal static string NodeVersion(string nodeExe)
@@ -1261,6 +1476,24 @@ namespace DshLauncher
         {
             get
             {
+                // npm 方式：优先读全局安装的 @deepseek-ai/dsh 版本
+                try
+                {
+                    string dshCli = FindDshCli();
+                    if (dshCli != null)
+                    {
+                        string pkg = Path.Combine(Path.GetDirectoryName(Path.GetDirectoryName(dshCli)), "package.json");
+                        string json = File.ReadAllText(pkg);
+                        using var doc = JsonDocument.Parse(json);
+                        if (doc.RootElement.TryGetProperty("version", out var v))
+                        {
+                            string ver = v.GetString();
+                            if (!string.IsNullOrEmpty(ver)) return ver;
+                        }
+                    }
+                }
+                catch { }
+                // 回退：从源码目录 package.json 读（兼容旧方式）
                 try
                 {
                     string json = File.ReadAllText(Path.Combine(WorkDir, "package.json"));
@@ -1711,6 +1944,88 @@ namespace DshLauncher
                 MessageBox.Show("自动安装 WebView2 失败：" + ex.Message +
                     "\n\n请手动到以下地址安装：\nhttps://developer.microsoft.com/microsoft-edge/webview2/",
                     "安装失败", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            }
+        }
+
+        /// <summary>
+        /// 自动升级 node 到 v24（免安装 zip 解压到 LauncherDir\node）。
+        /// 背景：dsh 0.1.1+ 的 scripts/build.ts 用 import.meta.main 判断入口，该特性在 node22+tsx 下为
+        /// undefined 导致构建静默失败；node 24 稳定支持。升级后 FindNode 优先使用自管理 node 24。
+        /// </summary>
+        private async Task TryUpgradeNodeAsync()
+        {
+            try
+            {
+                string current = FindNode();
+                string curVer = current != null ? NodeVersion(current) : null;
+                if (curVer != null && MajorOf(curVer) >= 24)
+                {
+                    Log("当前 node 已为 v24+（" + curVer + "），无需升级。");
+                    MessageBox.Show("当前 Node.js 版本：" + curVer + "（≥ v24），已满足要求，无需升级。",
+                        "Node.js 版本", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    return;
+                }
+                var r = MessageBox.Show(
+                    "当前 Node.js：" + (curVer ?? "未找到") + "\n\n" +
+                    "dsh 0.1.1+ 的构建需要 node v24（v22 下 import.meta.main 不生效，可能导致构建失败）。\n" +
+                    "是否自动下载并安装 node v24.12.0（免安装版，解压到启动器目录，不改系统环境变量）？",
+                    "升级 Node.js 到 v24", MessageBoxButtons.YesNo, MessageBoxIcon.Question);
+                if (r != DialogResult.Yes) return;
+
+                const string ver = "24.12.0";
+                string zipPath = Path.Combine(LauncherDir, "node-upgrade.zip");
+                string destDir = Path.Combine(ManagedNodeDir, "node-v" + ver + "-win-x64");
+                string[] urls =
+                {
+                    @"https://nodejs.org/dist/v" + ver + @"/node-v" + ver + @"-win-x64.zip",          // 官方
+                    @"https://npmmirror.com/mirrors/node/v" + ver + @"/node-v" + ver + @"-win-x64.zip", // 国内镜像
+                };
+
+                Log("正在下载 node v" + ver + " ...");
+                bool downloaded = false;
+                foreach (var url in urls)
+                {
+                    foreach (bool useProxy in new[] { false, true })
+                    {
+                        try
+                        {
+                            using (var client = MainForm.CreateHttpClient(600, useProxy))
+                            {
+                                var resp = await client.GetAsync(url, HttpCompletionOption.ResponseHeadersRead);
+                                if (!resp.IsSuccessStatusCode) { Log("HTTP " + (int)resp.StatusCode + "，尝试下一源..."); continue; }
+                                using var fs = new FileStream(zipPath, FileMode.Create, FileAccess.Write, FileShare.None);
+                                await resp.Content.CopyToAsync(fs);
+                            }
+                            downloaded = true; break;
+                        }
+                        catch (Exception ex) { Log("下载 node 失败：" + ex.Message + "，尝试下一源..."); }
+                    }
+                    if (downloaded) break;
+                }
+                if (!downloaded) throw new Exception("node v" + ver + " 下载失败（所有源均不可用）");
+
+                Log("node 下载完成（" + new FileInfo(zipPath).Length / 1024 / 1024 + " MB），正在解压 ...");
+                Directory.CreateDirectory(ManagedNodeDir);
+                if (Directory.Exists(destDir)) Directory.Delete(destDir, true);
+                ZipFile.ExtractToDirectory(zipPath, ManagedNodeDir);
+                try { File.Delete(zipPath); } catch { }
+
+                // 验证解压出的 node 可用
+                string newExe = Path.Combine(destDir, "node.exe");
+                string newVer = File.Exists(newExe) ? NodeVersion(newExe) : null;
+                if (newVer == null) throw new Exception("解压后未找到可用的 node.exe");
+                Log("node v" + ver + " 安装完成，位于 " + destDir + "（" + newVer + "）。重启启动器后生效。");
+                MessageBox.Show(
+                    "Node.js 已升级到 " + newVer + "（免安装版）。\n\n" +
+                    "请关闭并重新打开启动器，之后将优先使用 node v24 进行构建，可解决 dsh 构建失败问题。",
+                    "升级完成", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            }
+            catch (Exception ex)
+            {
+                Log("升级 node 失败：" + ex.Message);
+                MessageBox.Show("自动升级 Node.js 失败：\n" + ex.Message +
+                    "\n\n可手动到 https://nodejs.org/en/download 下载 v24 win-x64 版本。",
+                    "升级失败", MessageBoxButtons.OK, MessageBoxIcon.Warning);
             }
         }
 

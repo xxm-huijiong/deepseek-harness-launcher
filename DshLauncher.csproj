@@ -8,7 +8,7 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <AssemblyName>DshLauncher</AssemblyName>
     <RootNamespace>DshLauncher</RootNamespace>
-    <Version>1.5.1</Version>
+    <Version>1.5.3</Version>
     <ApplicationIcon>deepseek.ico</ApplicationIcon>
     <PublishSingleFile>true</PublishSingleFile>
     <SelfContained>false</SelfContained>
