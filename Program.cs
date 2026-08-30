@@ -133,10 +133,10 @@ namespace DshLauncher
         private CheckBox _chkNotify;         // 任务提醒（等待确认/任务完成时气泡+提示音）
         private CheckBox _chkBackOnly;       // 后台才提醒（窗口在前端时不弹通知，需勾选任务提醒才生效）
 
-        // 事件监听（events.mux / events.host）：审批提醒 + 回合级任务完成提醒
+        // 事件监听（events.mux）：审批提醒 + 回合级任务完成提醒（只提醒主会话）
         private System.Threading.CancellationTokenSource _eventCts;
         private readonly Dictionary<string, string> _lastAssistantText = new();   // sessionId → 最近一条模型答复文本（回合完成摘要）
-        private readonly HashSet<string> _subagentSessions = new();               // 子代理会话（其回合结束不弹通知）
+        private string _mainSession;                                               // 主会话（最近有用户输入 user/message 的会话）；只提醒它的回合完成
         private readonly HashSet<string> _notifiedApprovals = new();              // approvalId 去重
         private bool _eventMonitorStarted;
 
@@ -608,7 +608,8 @@ namespace DshLauncher
                     var psi = new ProcessStartInfo
                     {
                         FileName = node,
-                        Arguments = "\"" + dshCli + "\" web",
+                        // --no-open：禁止 dsh 自动打开系统默认浏览器（启动器内置 WebView2 会加载页面，避免重复打开）
+                        Arguments = "\"" + dshCli + "\" web --no-open",
                         WorkingDirectory = LauncherDir,
                         UseShellExecute = false,
                         RedirectStandardOutput = true,
@@ -1513,9 +1514,9 @@ namespace DshLauncher
             if (_eventMonitorStarted || _eventCts != null) return;
             _eventCts = new System.Threading.CancellationTokenSource();
             _eventMonitorStarted = true;
-            // 双流：events.mux（审批 + 回合事件）+ events.host（会话元信息，用于过滤子代理会话）
+            // 单流 events.mux：审批 + 回合事件。子代理过滤不再依赖 events.host 会话列表，
+            // 改为「只提醒主会话」：通过 user/message 识别用户正在交互的会话，兼容 dsh 未来格式变化。
             _ = Task.Run(() => EventStreamLoopAsync("/api/events.mux", "事件监听", ProcessEvent, _eventCts.Token));
-            _ = Task.Run(() => EventStreamLoopAsync("/api/events.host", "主机事件监听", ProcessHostEvent, _eventCts.Token));
         }
 
         private void StopEventMonitor()
@@ -1595,7 +1596,13 @@ namespace DshLauncher
             string etype = ev.TryGetProperty("type", out var t) ? t.GetString() : "";
             if (!ev.TryGetProperty("data", out var data) || data.ValueKind != JsonValueKind.Object) return;
 
-            if (etype == "assistant/message")
+            if (etype == "user/message")
+            {
+                // 主会话识别：用户主动输入消息的会话即主会话（子代理由 dsh 内部驱动，无 user/message）。
+                // 只提醒主会话的回合完成，从而自然过滤掉子代理（兼容 dsh 未来格式变化，不依赖会话列表）。
+                if (!string.IsNullOrEmpty(sessionId)) _mainSession = sessionId;
+            }
+            else if (etype == "assistant/message")
             {
                 // 记录该会话最近一条模型答复，回合结束时作为「任务已完成」摘要
                 if (data.TryGetProperty("message", out var msg)
@@ -1623,8 +1630,9 @@ namespace DshLauncher
             }
             else if (etype == "turn/end")
             {
-                // 子代理会话的回合结束不打扰用户
-                if (_subagentSessions.Contains(sessionId)) return;
+                // 只提醒主会话（最近有用户输入的会话）的回合完成；子代理/其他会话不打扰。
+                // 尚未识别到主会话（用户还没在当前会话发过消息）时，暂时不提醒，避免子代理误报。
+                if (_mainSession == null || sessionId != _mainSession) return;
 
                 string reasonKind = "";
                 string errorMessage = "";
@@ -1651,39 +1659,6 @@ namespace DshLauncher
                     // blocked / max-tokens / interrupted 等不弹通知
                 }
             }
-        }
-
-        /// <summary>host 流：跟踪子代理会话（host/session-added 带 origin=subagent / parentSessionId），过滤其回合结束通知。</summary>
-        private void ProcessHostEvent(string text)
-        {
-            try
-            {
-                using var doc = JsonDocument.Parse(text);
-                var root = doc.RootElement;
-                if (!root.TryGetProperty("method", out var m)) return;
-                string method = m.GetString();
-                if (!root.TryGetProperty("payload", out var payload)) return;
-
-                if (method == "host/session-added")
-                {
-                    string sessionId = payload.TryGetProperty("sessionId", out var s) ? s.GetString() ?? "" : "";
-                    if (string.IsNullOrEmpty(sessionId)) return;
-                    string origin = payload.TryGetProperty("origin", out var o) ? o.GetString() : "";
-                    if (origin == "subagent" || payload.TryGetProperty("parentSessionId", out _))
-                    {
-                        if (_subagentSessions.Count > 500) _subagentSessions.Clear();
-                        _subagentSessions.Add(sessionId);
-                    }
-                }
-                else if (method == "host/session-removed")
-                {
-                    string sessionId = payload.TryGetProperty("sessionId", out var s) ? s.GetString() ?? "" : "";
-                    if (string.IsNullOrEmpty(sessionId)) return;
-                    _subagentSessions.Remove(sessionId);
-                    _lastAssistantText.Remove(sessionId);
-                }
-            }
-            catch { }
         }
 
         private static string Shorten(string s, int max)
