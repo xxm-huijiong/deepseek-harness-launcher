@@ -72,11 +72,13 @@ namespace DshLauncher
     internal class MainForm : Form
     {
         // ── 路径配置（以启动器所在目录为根，随 exe 位置，放任意盘/目录均可） ──
-        internal static readonly string LauncherDir = Path.GetDirectoryName(Environment.ProcessPath) ?? @"D:\dsh-launcher";
+        internal static readonly string LauncherDir = Path.GetDirectoryName(Environment.ProcessPath) ?? Environment.CurrentDirectory;
         internal static string WorkDir = Path.Combine(LauncherDir, "dsh-src");          // dsh 源码目录（可由 config.json 的 workDir 重定向）
         private static readonly string ConfigFile = Path.Combine(LauncherDir, "config.json");
         private static readonly string DshHomeDir = Path.Combine(LauncherDir, "userdata");
-        private const string LegacyHomeDir = @"C:\Users\wujiong\.dsh";                 // 旧版默认 home（仅本机迁移用，其他机器无此目录会自动跳过）
+        // 旧版默认 home = 用户主目录下 .dsh（从环境变量推导，兼容任意机器）
+        private static readonly string LegacyHomeDir = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".dsh");
         internal static readonly string LogFile = Path.Combine(LauncherDir, "launcher.log");
         private static readonly string WebViewDataDir = Path.Combine(LauncherDir, "webview-data-v3");
         internal const string SourceRepoUrl = @"https://github.com/deepseek-ai/deepseek-harness";                    // dsh 官方仓库
@@ -101,13 +103,6 @@ namespace DshLauncher
         private const int ActionsBarHeight = 70;  // 底部操作栏（展开时：第一行按钮 + 第二行复选框）
         private const int LogPanelHeight = 168;   // 底部日志面板（展开时）
 
-        // Node / pnpm 候选（按优先级；PATH 优先，以下作为回退）
-        private static readonly string[] NodeCandidates =
-        {
-            @"C:\Users\wujiong\.workbuddy\binaries\node\versions\22.22.2\node.exe",   // 已知满足 ^22.19
-            @"D:\nodejs\node.exe"                                                      // 回退
-        };
-        private const string PnpmCjs = @"D:\npm-global\node_modules\pnpm\bin\pnpm.cjs"; // 本机回退路径
         // 启动器自管理的 node（免安装 zip 解压到 LauncherDir\node），优先使用以规避 node22 的 import.meta.main 问题
         internal static readonly string ManagedNodeDir = Path.Combine(LauncherDir, "node");
 
@@ -1077,27 +1072,14 @@ namespace DshLauncher
             // 0) 启动器自管理的 node（LauncherDir\node\node-v*/node.exe，优先 node 24+；无则取版本 OK 的）
             string managed = FindManagedNode();
             if (managed != null) return managed;
-            // 1) PATH 中查找 node（开源环境的主要途径）
+            // 1) PATH 环境变量中查找 node（最通用，无本机路径依赖）
             string pathNode = ResolveFromPath("node");
             if (pathNode != null)
             {
                 string v = NodeVersion(pathNode);
                 if (v != null && IsVersionOk(v)) return pathNode;
             }
-            // 2) 硬编码候选（本机已知可用路径回退）
-            string best = null, fallback = null;
-            foreach (var c in NodeCandidates)
-            {
-                if (!File.Exists(c)) continue;
-                string ver = NodeVersion(c);
-                if (ver != null)
-                {
-                    if (IsVersionOk(ver)) return c;
-                    fallback ??= c;
-                }
-                else best ??= c;
-            }
-            return best ?? fallback;
+            return null;
         }
 
         /// <summary>在自管理 node 目录里找 node.exe；优先版本 ≥24（规避 node22 的 import.meta.main 问题），否则取版本 OK 的。</summary>
@@ -1145,8 +1127,6 @@ namespace DshLauncher
             string npmGlobal = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "npm");
             string candidate2 = Path.Combine(npmGlobal, "node_modules", "pnpm", "bin", "pnpm.cjs");
             if (File.Exists(candidate2)) return candidate2;
-            // 3) 本机已知路径回退
-            if (File.Exists(PnpmCjs)) return PnpmCjs;
             return null;
         }
 
