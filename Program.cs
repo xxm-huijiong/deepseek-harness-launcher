@@ -46,13 +46,12 @@ namespace DshLauncher
             Application.SetCompatibleTextRenderingDefault(false);
             MainForm.LoadConfig();   // 读取 config.json（可重定向 dsh 源码目录）
 
-            // 首次使用：先跑安装向导，环境与源码就绪后才进入主界面
-            if (!MainForm.HasDshSource())
+            // 首次使用：dsh 全局包未安装时跑安装向导（npm install -g @deepseek-ai/dsh）
+            if (MainForm.FindDshCli() == null)
             {
                 using var installer = new InstallForm();
                 Application.Run(installer);
                 if (!installer.Completed) return;   // 用户取消 → 退出
-                MainForm.LoadConfig();              // 安装/选择目录可能改写 workDir
             }
 
             // 启动时检查更新（前置更新窗口）：立即弹出「检查更新」窗口并显示检查状态，
@@ -228,7 +227,7 @@ namespace DshLauncher
             trayMenu.Items.Add(_menuBackOnly);
 
             trayMenu.Items.Add(new ToolStripSeparator());
-            trayMenu.Items.Add("升级 Node.js 到 v24", null, (s, e) => _ = TryUpgradeNodeAsync());
+            trayMenu.Items.Add("升级 Node.js 到 v24", null, (s, e) => _ = TryUpgradeNodeAsync(this, Log));
             trayMenu.Items.Add(new ToolStripSeparator());
             trayMenu.Items.Add("退出", null, (s, e) => ExitApp());
             _trayIcon.ContextMenuStrip = trayMenu;
@@ -496,7 +495,7 @@ namespace DshLauncher
                     "是否自动升级到 node v24（免安装版，不改系统环境变量）？",
                     "建议升级 Node.js", MessageBoxButtons.YesNo, MessageBoxIcon.Question);
                 if (r == DialogResult.Yes)
-                    await TryUpgradeNodeAsync();
+                    await TryUpgradeNodeAsync(this, Log);
             }
             catch { }
         }
@@ -1927,7 +1926,7 @@ namespace DshLauncher
         /// 背景：dsh 0.1.1+ 的 scripts/build.ts 用 import.meta.main 判断入口，该特性在 node22+tsx 下为
         /// undefined 导致构建静默失败；node 24 稳定支持。升级后 FindNode 优先使用自管理 node 24。
         /// </summary>
-        private async Task TryUpgradeNodeAsync()
+        internal static async Task TryUpgradeNodeAsync(IWin32Window owner, Action<string> log)
         {
             try
             {
@@ -1935,12 +1934,12 @@ namespace DshLauncher
                 string curVer = current != null ? NodeVersion(current) : null;
                 if (curVer != null && MajorOf(curVer) >= 24)
                 {
-                    Log("当前 node 已为 v24+（" + curVer + "），无需升级。");
-                    MessageBox.Show("当前 Node.js 版本：" + curVer + "（≥ v24），已满足要求，无需升级。",
+                    log("当前 node 已为 v24+（" + curVer + "），无需升级。");
+                    MessageBox.Show(owner, "当前 Node.js 版本：" + curVer + "（≥ v24），已满足要求，无需升级。",
                         "Node.js 版本", MessageBoxButtons.OK, MessageBoxIcon.Information);
                     return;
                 }
-                var r = MessageBox.Show(
+                var r = MessageBox.Show(owner,
                     "当前 Node.js：" + (curVer ?? "未找到") + "\n\n" +
                     "dsh 0.1.1+ 的构建需要 node v24（v22 下 import.meta.main 不生效，可能导致构建失败）。\n" +
                     "是否自动下载并安装 node v24.12.0（免安装版，解压到启动器目录，不改系统环境变量）？",
@@ -1956,7 +1955,7 @@ namespace DshLauncher
                     @"https://npmmirror.com/mirrors/node/v" + ver + @"/node-v" + ver + @"-win-x64.zip", // 国内镜像
                 };
 
-                Log("正在下载 node v" + ver + " ...");
+                log("正在下载 node v" + ver + " ...");
                 bool downloaded = false;
                 foreach (var url in urls)
                 {
@@ -1967,19 +1966,19 @@ namespace DshLauncher
                             using (var client = MainForm.CreateHttpClient(600, useProxy))
                             {
                                 var resp = await client.GetAsync(url, HttpCompletionOption.ResponseHeadersRead);
-                                if (!resp.IsSuccessStatusCode) { Log("HTTP " + (int)resp.StatusCode + "，尝试下一源..."); continue; }
+                                if (!resp.IsSuccessStatusCode) { log("HTTP " + (int)resp.StatusCode + "，尝试下一源..."); continue; }
                                 using var fs = new FileStream(zipPath, FileMode.Create, FileAccess.Write, FileShare.None);
                                 await resp.Content.CopyToAsync(fs);
                             }
                             downloaded = true; break;
                         }
-                        catch (Exception ex) { Log("下载 node 失败：" + ex.Message + "，尝试下一源..."); }
+                        catch (Exception ex) { log("下载 node 失败：" + ex.Message + "，尝试下一源..."); }
                     }
                     if (downloaded) break;
                 }
                 if (!downloaded) throw new Exception("node v" + ver + " 下载失败（所有源均不可用）");
 
-                Log("node 下载完成（" + new FileInfo(zipPath).Length / 1024 / 1024 + " MB），正在解压 ...");
+                log("node 下载完成（" + new FileInfo(zipPath).Length / 1024 / 1024 + " MB），正在解压 ...");
                 Directory.CreateDirectory(ManagedNodeDir);
                 if (Directory.Exists(destDir)) Directory.Delete(destDir, true);
                 ZipFile.ExtractToDirectory(zipPath, ManagedNodeDir);
@@ -1989,16 +1988,16 @@ namespace DshLauncher
                 string newExe = Path.Combine(destDir, "node.exe");
                 string newVer = File.Exists(newExe) ? NodeVersion(newExe) : null;
                 if (newVer == null) throw new Exception("解压后未找到可用的 node.exe");
-                Log("node v" + ver + " 安装完成，位于 " + destDir + "（" + newVer + "）。重启启动器后生效。");
-                MessageBox.Show(
+                log("node v" + ver + " 安装完成，位于 " + destDir + "（" + newVer + "）。重启启动器后生效。");
+                MessageBox.Show(owner,
                     "Node.js 已升级到 " + newVer + "（免安装版）。\n\n" +
                     "请关闭并重新打开启动器，之后将优先使用 node v24 进行构建，可解决 dsh 构建失败问题。",
                     "升级完成", MessageBoxButtons.OK, MessageBoxIcon.Information);
             }
             catch (Exception ex)
             {
-                Log("升级 node 失败：" + ex.Message);
-                MessageBox.Show("自动升级 Node.js 失败：\n" + ex.Message +
+                log("升级 node 失败：" + ex.Message);
+                MessageBox.Show(owner, "自动升级 Node.js 失败：\n" + ex.Message +
                     "\n\n可手动到 https://nodejs.org/en/download 下载 v24 win-x64 版本。",
                     "升级失败", MessageBoxButtons.OK, MessageBoxIcon.Warning);
             }

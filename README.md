@@ -33,7 +33,7 @@ https://github.com/xxm-huijiong/deepseek-harness-launcher/releases
 ```
 
 下载 `dsh-launcher.exe`（框架依赖版，约 1.6MB；需目标机装有 .NET 7 Desktop Runtime）或 `dsh-launcher-standalone.exe`（自包含版，约 150MB，免装 .NET）。
-运行前先确认已满足「环境要求」（.NET 7 Desktop Runtime / WebView2 / Node.js / pnpm；WebView2 缺失时启动器会自动下载安装）。
+运行前先确认已满足「环境要求」（.NET 7 Desktop Runtime / WebView2 / Node.js；WebView2 缺失时启动器会自动下载安装，Node.js 缺失时可自动安装 node v24）。
 
 **方式二：从源码自行编译**
 
@@ -43,26 +43,23 @@ https://github.com/xxm-huijiong/deepseek-harness-launcher/releases
 
 ## 快速开始
 
-**第一步：安装运行环境**（Windows 不自带，需手动安装一次）
+**第一步：安装运行环境**（Windows 不自带）
 
-| 依赖                     | 作用        | 下载                                                        |
+| 依赖                     | 作用        | 说明                                                        |
 | ---------------------- | --------- | --------------------------------------------------------- |
 | .NET 7 Desktop Runtime | 运行启动器本体   | https://dotnet.microsoft.com/download/dotnet/7.0          |
 | WebView2 Runtime       | 内置浏览器内核   | Win11 自带；缺失时启动器会**自动下载并静默安装**（约 2MB，无需管理员），也可点「修复浏览器」手动安装 |
-| Node.js ≥ 22.19        | 运行 dsh 服务 | https://nodejs.org                                        |
-| pnpm                   | 安装 dsh 依赖 | 装完 Node 后执行 `npm install -g pnpm`                         |
+| Node.js ≥ 24           | 运行 dsh 服务 | 缺失时启动器可**自动下载免安装版 node v24**（托盘菜单「升级 Node.js 到 v24」，不改系统环境变量） |
 
 **第二步：打开启动器**
 
-双击 `dsh-launcher.exe`。若本机还没有 dsh 源码，会弹出引导：
+双击 `dsh-launcher.exe`。首次使用会弹出安装向导：
 
-1. **【是】自动下载安装** —— 从 GitHub 下载 dsh 源码，自动解压并安装依赖（会询问使用**国内镜像**还是直连）
-2. **【否】手动选择目录** —— 如果你已手动下载/解压了 dsh 源码，选择那个目录即可
-3. **【取消】** —— 退出
+1. 点**「开始安装」** —— 自动执行 `npm install -g @deepseek-ai/dsh` 安装 dsh 全局包（无需源码构建）
+2. **「跳过」** —— 若 dsh 已全局安装可直接进入
+3. **「取消」** —— 退出
 
-完成后启动器会记住源码位置（`config.json` 的 `workDir`），下次直接启动。
-
-> dsh 源码默认存放在启动器目录下的 `dsh-src\`；也可以放其他位置后手动指定。
+安装完成后即进入主界面，自动启动 dsh 服务并打开内置页面。
 
 ---
 
@@ -88,7 +85,7 @@ pnpm run build
 pnpm dsh web
 ```
 
-> 本启动器采用**源码方式**管理 dsh 本体：自动下载后执行 `pnpm install`，用 `pnpm dsh web` 启动服务（源码模式下由 tsx 直接运行，无需手动 build；需要正式构建时执行 `pnpm run build`）。
+> 本启动器采用**方式一（npm 直装）**管理 dsh 本体：首次使用自动执行 `npm install -g @deepseek-ai/dsh`，用 node v24 运行全局 dsh 包的 `web` 命令启动服务，无需源码构建。更新同样通过 npm 完成。
 
 ---
 
@@ -142,9 +139,7 @@ dotnet publish -c Release -r win-x64 --self-contained false -p:PublishSingleFile
 ├─ webview-data-v3\              ← 内置浏览器缓存（可重建）
 ├─ launcher.log                  ← 运行日志
 ├─ backups\                      ← 「备份数据」按钮的输出目录（backup-<时间戳>\userdata\...）
-├─ update-dsh.bat                ← 一键更新脚本（需 dsh 源码为 git 仓库）
 ├─ build.bat                     ← 一键编译脚本（开发者）
-└─ dsh-src\                      ← dsh 源码（默认位置，也可在别处并手动指定）
 ```
 
 ---
@@ -166,15 +161,13 @@ dotnet publish -c Release -r win-x64 --self-contained false -p:PublishSingleFile
 
 ## 更新 dsh
 
-**推荐：启动器内置一键更新** —— 启动时（或点「检查更新」）发现新版后，在更新窗口点「立即更新」：
+启动器内置一键更新 —— 启动时（或点「检查更新」）发现新版后，在更新窗口点「立即更新」：
 
-1. 自动停止占用源码目录的进程（3080 端口监听 + 所有命令行指向源码目录的 node/git 进程）
-2. git 仓库 → `git fetch + reset`；普通目录 → 下载官方源码 zip 后**文件级合并覆盖**
-3. 合并前二次确认：将覆盖同名文件；你自行添加的文件（新包里没有的，如 `_launcher_build*`、`.agents` 等）自动保留，建议先手动备份
-4. 自动 `pnpm install` + `pnpm run build`；文件被占用时自动重试并提示具体路径，失败可整流程重试
+1. 自动停止占用 3080 端口的服务进程
+2. 执行 `npm install -g @deepseek-ai/dsh` 更新 dsh 全局包（无需源码构建）
+3. 更新完成后重启服务即使用新版
 
-> 更新只动 dsh 源码目录，`userdata` 用户数据不受影响。
-> 若源码是 git 仓库，也可双击 `update-dsh.bat` 手动更新（git pull + 安装依赖 + 构建）。
+> 更新只替换 dsh 运行包，`userdata` 用户数据不受影响。
 
 ---
 
@@ -195,8 +188,8 @@ dotnet publish -c Release -r win-x64 --self-contained false -p:PublishSingleFile
 **Q：自动下载很慢 / 失败？**
 改用国内镜像重试，或手动从 GitHub 下载后选「手动选择目录」。
 
-**Q：node / pnpm 未找到？**
-按引导安装 Node.js ≥ 22.19（nodejs.org），然后 `npm install -g pnpm`。
+**Q：node 未找到？**
+在启动器托盘菜单点「升级 Node.js 到 v24」自动下载免安装版 node（不改系统环境变量）；或手动到 nodejs.org 安装 Node.js ≥ 22.19。
 
 **Q：编译时报 .NET SDK 错误？**
 Windows 不自带 .NET SDK，从 https://dotnet.microsoft.com/download/dotnet/7.0 安装后重试。
