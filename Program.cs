@@ -126,6 +126,7 @@ namespace DshLauncher
         private CheckBox _chkAutoCheck;      // 启动时检查更新
         private CheckBox _chkNotify;         // 任务提醒（等待确认/任务完成时气泡+提示音）
         private CheckBox _chkBackOnly;       // 后台才提醒（窗口在前端时不弹通知，需勾选任务提醒才生效）
+        private CheckBox _chkEmbedded;       // 启动时用内置浏览器打开（取消则用系统浏览器，服务就绪后缩到托盘）
 
         // 事件监听（events.mux）：审批提醒 + 回合级任务完成提醒（只提醒主会话）
         private System.Threading.CancellationTokenSource _eventCts;
@@ -146,6 +147,7 @@ namespace DshLauncher
         private ToolStripMenuItem _menuAutoCheck; // 托盘菜单选项：启动时检查更新
         private ToolStripMenuItem _menuNotify;    // 托盘菜单选项：任务提醒
         private ToolStripMenuItem _menuBackOnly;  // 托盘菜单选项：后台才提醒
+        private ToolStripMenuItem _menuEmbedded;  // 托盘菜单选项：启动时用内置浏览器打开
         private bool _forceExit;               // 托盘「退出」触发真正退出
         private bool _trayNotified;          // 首次隐藏到托盘的气泡提示已显示
 
@@ -220,6 +222,11 @@ namespace DshLauncher
             _menuBackOnly = new ToolStripMenuItem("后台才提醒") { CheckOnClick = true, Checked = true };
             _menuBackOnly.CheckedChanged += (s, e) => SyncCheckbox(_chkBackOnly, _menuBackOnly.Checked);
             trayMenu.Items.Add(_menuBackOnly);
+
+            _menuEmbedded = new ToolStripMenuItem("内置浏览器打开") { CheckOnClick = true, Checked = UseEmbeddedBrowser };
+            // 持久化由复选框自己的 CheckedChanged 处理（SyncCheckbox 设置后自动触发）
+            _menuEmbedded.CheckedChanged += (s, e) => SyncCheckbox(_chkEmbedded, _menuEmbedded.Checked);
+            trayMenu.Items.Add(_menuEmbedded);
 
             trayMenu.Items.Add(new ToolStripSeparator());
             trayMenu.Items.Add("升级 Node.js 到 v24", null, (s, e) => _ = TryUpgradeNodeAsync(this, Log));
@@ -317,6 +324,19 @@ namespace DshLauncher
                 Font = new Font(Font.FontFamily, 9f)
             });
             _chkBackOnly.CheckedChanged += (s, e) => { if (_menuBackOnly != null) _menuBackOnly.Checked = _chkBackOnly.Checked; };
+            _actionsPanel.Controls.Add(_chkEmbedded = new CheckBox
+            {
+                Text = "内置浏览器打开",
+                Location = new Point(508, 42),
+                Size = new Size(150, 22),
+                Checked = UseEmbeddedBrowser,
+                Font = new Font(Font.FontFamily, 9f)
+            });
+            _chkEmbedded.CheckedChanged += (s, e) =>
+            {
+                if (_menuEmbedded != null) _menuEmbedded.Checked = _chkEmbedded.Checked;
+                UseEmbeddedBrowser = _chkEmbedded.Checked; SaveConfig();
+            };
             Controls.Add(_actionsPanel);
 
             // 内置浏览器（手动布局）
@@ -562,8 +582,8 @@ namespace DshLauncher
                 if (_managedServer != null && !_managedServer.HasExited)
                 {
                     Log("服务已由本启动器运行中。");
-                    _uiLoaded = false;
-                    LoadUi();
+                    if (UseEmbeddedBrowser) { _uiLoaded = false; LoadUi(); }
+                    else MinimizeToTray();
                     return;
                 }
 
@@ -574,7 +594,8 @@ namespace DshLauncher
                     _externalInstance = true;
                     Log("检测到端口 3080 已有 dsh 实例在运行，直接连接。");
                     SetUiRunning(true, managed: false);
-                    LoadUi();
+                    if (UseEmbeddedBrowser) LoadUi();
+                    else MinimizeToTray();
                     return;
                 }
                 if (probe == ProbeState.Other)
@@ -602,8 +623,9 @@ namespace DshLauncher
                     var psi = new ProcessStartInfo
                     {
                         FileName = node,
-                        // --no-open：禁止 dsh 自动打开系统默认浏览器（启动器内置 WebView2 会加载页面，避免重复打开）
-                        Arguments = "\"" + dshCli + "\" web --no-open",
+                        // 「内置浏览器打开」开启时传 --no-open 禁止 dsh 自动开系统浏览器（由内置 WebView2 加载页面）；
+                        // 关闭时不传，让 dsh 启动时自动打开系统默认浏览器。
+                        Arguments = "\"" + dshCli + "\" web" + (UseEmbeddedBrowser ? " --no-open" : ""),
                         WorkingDirectory = LauncherDir,
                         UseShellExecute = false,
                         RedirectStandardOutput = true,
@@ -619,7 +641,12 @@ namespace DshLauncher
                     psi.Environment["NODE_OPTIONS"] = "--use-system-ca";
 
                     _managedServer = new Process { StartInfo = psi, EnableRaisingEvents = true };
-                    _managedServer.OutputDataReceived += (s, ev) => { if (ev.Data != null) Log(ev.Data); };
+                    _managedServer.OutputDataReceived += (s, ev) =>
+                    {
+                        if (ev.Data == null) return;
+                        TryCaptureUiUrl(ev.Data);   // 从输出捕获带 token 的服务地址（dsh 0.1.2+ 启用令牌鉴权）
+                        Log(ev.Data);
+                    };
                     _managedServer.ErrorDataReceived += (s, ev) => { if (ev.Data != null) Log("[err] " + ev.Data); };
                     _managedServer.Exited += (s, ev) => { if (!_shuttingDown) Log("服务进程已退出。"); };
 
@@ -636,7 +663,10 @@ namespace DshLauncher
                     if (ready)
                     {
                         Log("服务已就绪。");
-                        LoadUi();
+                        if (UseEmbeddedBrowser)
+                            LoadUi();
+                        else
+                            MinimizeToTray();   // 不用内置浏览器：dsh 已自动开系统浏览器，启动器缩到托盘
                         StartEventMonitor();   // 监听审批/任务事件（任务提醒）
                     }
                     else
@@ -694,6 +724,23 @@ namespace DshLauncher
                 Log("该实例由外部启动，不受本启动器管理。");
             }
             SetUiRunning(false, managed: p != null);
+        }
+
+        /// <summary>服务就绪后按设置缩到系统托盘（「内置浏览器打开」未勾选时使用：dsh 已自动开系统浏览器）。</summary>
+        private void MinimizeToTray()
+        {
+            if (IsDisposed) return;
+            if (InvokeRequired) { Invoke((Action)MinimizeToTray); return; }
+            _uiLoaded = false;
+            Hide();
+            Log("已按设置跳过内置浏览器，启动器已最小化到托盘。");
+            if (!_trayNotified)
+            {
+                _trayNotified = true;
+                _trayIcon.ShowBalloonTip(2500, "dsh-launcher",
+                    "服务已启动，已在系统浏览器打开。\n启动器已最小化到托盘，右键托盘图标可操作。",
+                    ToolTipIcon.Info);
+            }
         }
 
         private void LoadUi()
@@ -836,9 +883,43 @@ namespace DshLauncher
             }
         }
 
-        /// <summary>探测 dsh Web UI 实际路径（新版在根路径 /，旧版在 /web/），更新 UiUrl 以便加载正确页面。</summary>
+        /// <summary>从 dsh 服务输出行中捕获本机服务地址。
+        /// dsh 0.1.2+ 启用令牌鉴权，启动时打印形如 `dsh web: http://127.0.0.1:3080/?token=xxx` 的地址，
+        /// 无 token 的请求会被拒绝；捕获后用它做就绪探测与页面加载。</summary>
+        private void TryCaptureUiUrl(string line)
+        {
+            try
+            {
+                var m = Regex.Match(line ?? "", @"https?://[^\s)]+");
+                if (!m.Success) return;
+                string url = m.Value;
+                if (!url.Contains(":" + Port)) return;          // 只接受本机服务端口
+                if (url.IndexOf("token=", StringComparison.Ordinal) < 0) return;
+                if (UiUrl == url) return;
+                UiUrl = url;
+                Log("已捕获带令牌的服务地址。");
+            }
+            catch { }
+        }
+
+        /// <summary>构造 WebSocket 地址；若 UiUrl 带令牌则一并附加（dsh 0.1.2+ 的 WS 同样受令牌保护）。</summary>
+        private string WsUrl(string path)
+        {
+            string baseWs = "ws://127.0.0.1:" + Port + path;
+            try
+            {
+                var m = Regex.Match(UiUrl ?? "", @"[?&]token=([^&\s]+)");
+                if (m.Success) return baseWs + "?token=" + m.Groups[1].Value;
+            }
+            catch { }
+            return baseWs;
+        }
+
+        /// <summary>探测 dsh Web UI 实际路径（新版在根路径 /，旧版在 /web/），更新 UiUrl 以便加载正确页面。
+        /// 若已从服务输出捕获带令牌的地址则直接使用，不做探测（避免无 token 探测失败后覆盖）。</summary>
         private async Task ProbeUiPath()
         {
+            if ((UiUrl ?? "").IndexOf("token=", StringComparison.Ordinal) >= 0) return;
             string[] candidates = {
                 @"http://127.0.0.1:3080/",
                 @"http://127.0.0.1:3080/web/"
@@ -875,7 +956,7 @@ namespace DshLauncher
             {
                 using var ws = new ClientWebSocket();
                 var cts = new CancellationTokenSource(TimeSpan.FromSeconds(2));
-                await ws.ConnectAsync(new Uri("ws://127.0.0.1:" + Port + "/api/events.mux"), cts.Token);
+                await ws.ConnectAsync(new Uri(WsUrl("/api/events.mux")), cts.Token);
                 return ws.State == WebSocketState.Open;
             }
             catch
@@ -899,6 +980,7 @@ namespace DshLauncher
 
         // ── 配置与首次安装引导 ────────────────────────────────────
         internal static bool CheckUpdateOnStart = true;   // 启动时检查更新（config.json 持久化）
+        internal static bool UseEmbeddedBrowser = true;   // 启动时用内置浏览器打开（false=让 dsh 开系统浏览器，服务就绪后启动器缩到托盘）
 
         internal static void LoadConfig()
         {
@@ -917,6 +999,8 @@ namespace DshLauncher
                     }
                     if (doc.RootElement.TryGetProperty("checkUpdate", out var cu) && cu.ValueKind == JsonValueKind.False)
                         CheckUpdateOnStart = false;
+                    if (doc.RootElement.TryGetProperty("useEmbeddedBrowser", out var ue) && ue.ValueKind == JsonValueKind.False)
+                        UseEmbeddedBrowser = false;
                 }
             }
             catch { }
@@ -938,7 +1022,7 @@ namespace DshLauncher
             try
             {
                 File.WriteAllText(ConfigFile,
-                    JsonSerializer.Serialize(new { workDir = WorkDir, checkUpdate = CheckUpdateOnStart }, new JsonSerializerOptions { WriteIndented = true }));
+                    JsonSerializer.Serialize(new { workDir = WorkDir, checkUpdate = CheckUpdateOnStart, useEmbeddedBrowser = UseEmbeddedBrowser }, new JsonSerializerOptions { WriteIndented = true }));
             }
             catch { }
         }
@@ -1514,7 +1598,7 @@ namespace DshLauncher
                 try
                 {
                     using var ws = new System.Net.WebSockets.ClientWebSocket();
-                    await ws.ConnectAsync(new Uri("ws://127.0.0.1:" + Port + path), ct);
+                    await ws.ConnectAsync(new Uri(WsUrl(path)), ct);
                     Log(name + "已连接。");
                     var buf = new byte[65536];
                     while (ws.State == System.Net.WebSockets.WebSocketState.Open && !ct.IsCancellationRequested)
