@@ -2,7 +2,10 @@
 
 ## v1.5.6（2026-09-06）
 
-- 适配 dsh v0.1.2+ 令牌鉴权：自动从服务输出捕获带 `?token=` 的访问地址，用于就绪探测、内置页面加载与 WebSocket 事件监听，修复升级后服务就绪超时
+- 适配 dsh v0.1.2+ 令牌鉴权：鉴权采用 Cookie 机制（带 `?token=` 首访后下发），HTTP 与 WebSocket 共享 CookieContainer，自动从服务输出捕获带令牌的访问地址
+- 适配 dsh v0.1.2 事件协议重构：旧 `/api/events.mux`、`/api/events.host` 已被官方移除，事件监听重写为 `/api/remote.mux` 的 `$events` 流（open/item 帧），并按新事件白名单分发
+- 任务提醒基于新事件语义：`api-session/activity`（用户输入）识别主会话、`api-session/status`（agent 运行结束）触发完成提醒、`api-session/error` 失败提醒；`approval/request`、`user-questions/request` 确认提醒
+- 就绪判定改为 HTTP 就绪（事件通道由监听自行重连，不再阻塞页面加载）
 - 新增「内置浏览器打开」选项（默认勾选）：取消勾选后 dsh 启动时自动打开系统默认浏览器，服务就绪后启动器自动最小化到托盘
 - 版本号升级至 1.5.6
 

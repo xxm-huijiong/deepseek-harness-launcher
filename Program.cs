@@ -128,11 +128,11 @@ namespace DshLauncher
         private CheckBox _chkBackOnly;       // 后台才提醒（窗口在前端时不弹通知，需勾选任务提醒才生效）
         private CheckBox _chkEmbedded;       // 启动时用内置浏览器打开（取消则用系统浏览器，服务就绪后缩到托盘）
 
-        // 事件监听（events.mux）：审批提醒 + 回合级任务完成提醒（只提醒主会话）
+        // 事件监听（dsh 0.1.2+ /api/remote.mux Remote Stream 协议）：审批提醒 + 任务完成提醒（只提醒主会话）
         private System.Threading.CancellationTokenSource _eventCts;
-        private readonly Dictionary<string, string> _lastAssistantText = new();   // sessionId → 最近一条模型答复文本（回合完成摘要）
-        private string _mainSession;                                               // 主会话（最近有用户输入 user/message 的会话）；只提醒它的回合完成
-        private readonly HashSet<string> _notifiedApprovals = new();              // approvalId 去重
+        private string _mainSession;                                    // 主会话：最近有用户输入（api-session/activity）的会话；只提醒它的完成
+        private readonly HashSet<string> _runningSessions = new();      // agent 运行中的会话（running → false 即任务结束）
+        private long _remoteStreamSeq;                                  // remote.mux 逻辑流编号
         private bool _eventMonitorStarted;
 
         private Panel _logPanel;             // 底部日志面板（默认收起）
@@ -154,7 +154,12 @@ namespace DshLauncher
         // ── 运行状态 ──────────────────────────────────────────────
         private Process _managedServer;
         private bool _externalInstance;
-        private readonly HttpClient _http = new HttpClient { Timeout = TimeSpan.FromSeconds(2) };
+        // dsh 0.1.2+ 令牌鉴权：带 ?token= 首访会 303 + 下发 HttpOnly Cookie，之后靠 Cookie 鉴权。
+        // HTTP 与 WebSocket 共用同一 CookieContainer，WS 连接自动携带鉴权 Cookie。
+        private static readonly System.Net.CookieContainer AuthCookies = new();
+        private readonly HttpClient _http = new HttpClient(
+            new HttpClientHandler { CookieContainer = AuthCookies, UseCookies = true })
+        { Timeout = TimeSpan.FromSeconds(2) };
         private readonly System.Windows.Forms.Timer _statusTimer;
         private readonly System.Windows.Forms.Timer _bootWatchTimer;
         private bool _uiLoaded;
@@ -950,29 +955,13 @@ namespace DshLauncher
             }
         }
 
-        private async Task<bool> IsWsReadyAsync()
-        {
-            try
-            {
-                using var ws = new ClientWebSocket();
-                var cts = new CancellationTokenSource(TimeSpan.FromSeconds(2));
-                await ws.ConnectAsync(new Uri(WsUrl("/api/events.mux")), cts.Token);
-                return ws.State == WebSocketState.Open;
-            }
-            catch
-            {
-                return false;
-            }
-        }
-
         private async Task<bool> WaitReadyAsync(int timeoutSeconds)
         {
+            // HTTP 就绪即判定（页面加载用）；事件通道（remote.mux WS）由事件监听自行重连，不阻塞就绪判定。
             var sw = Stopwatch.StartNew();
             while (sw.Elapsed.TotalSeconds < timeoutSeconds)
             {
-                bool h = await IsHttpReadyAsync();
-                bool w = await IsWsReadyAsync();
-                if (h && w) return true;
+                if (await IsHttpReadyAsync()) return true;
                 await Task.Delay(500);
             }
             return false;
@@ -1577,9 +1566,9 @@ namespace DshLauncher
             if (_eventMonitorStarted || _eventCts != null) return;
             _eventCts = new System.Threading.CancellationTokenSource();
             _eventMonitorStarted = true;
-            // 单流 events.mux：审批 + 回合事件。子代理过滤不再依赖 events.host 会话列表，
-            // 改为「只提醒主会话」：通过 user/message 识别用户正在交互的会话，兼容 dsh 未来格式变化。
-            _ = Task.Run(() => EventStreamLoopAsync("/api/events.mux", "事件监听", ProcessEvent, _eventCts.Token));
+            // 单流 /api/remote.mux（dsh 0.1.2+ $events）：审批 + 会话状态事件。
+            // 子代理过滤用「只提醒主会话」：通过 api-session/activity 识别用户正在交互的会话。
+            _ = Task.Run(() => EventStreamLoopAsync("事件监听", _eventCts.Token));
         }
 
         private void StopEventMonitor()
@@ -1590,23 +1579,33 @@ namespace DshLauncher
             _eventCts = null;
         }
 
-        /// <summary>单条事件流循环：连接 → 逐条消息回调 → 断开 5 秒重连，直到取消。</summary>
-        private async Task EventStreamLoopAsync(string path, string name, Action<string> onMessage, System.Threading.CancellationToken ct)
+        /// <summary>
+        /// 事件监听主循环（dsh 0.1.2+ Remote Stream 协议）：
+        /// 连接 /api/remote.mux（需鉴权 Cookie）→ 打开 $events 逻辑流 → 处理事件帧，断开 5 秒重连。
+        /// 旧版 /api/events.mux、/api/events.host 已在 0.1.2 移除。
+        /// </summary>
+        private async Task EventStreamLoopAsync(string name, System.Threading.CancellationToken ct)
         {
             while (!ct.IsCancellationRequested)
             {
                 try
                 {
                     using var ws = new System.Net.WebSockets.ClientWebSocket();
-                    await ws.ConnectAsync(new Uri(WsUrl(path)), ct);
+                    ws.Options.Cookies = AuthCookies;      // 携带 dsh 鉴权 Cookie
+                    await ws.ConnectAsync(new Uri(WsUrl("/api/remote.mux")), ct);
                     Log(name + "已连接。");
-                    var buf = new byte[65536];
+                    // 打开 $events 逻辑流（payload 必须是 {"args":{}}）
+                    string streamId = "launcher-" + Interlocked.Increment(ref _remoteStreamSeq);
+                    string openMsg = "{\"type\":\"open\",\"streamId\":\"" + streamId + "\",\"endpoint\":\"$events\",\"payload\":{\"args\":{}}}";
+                    var openBytes = System.Text.Encoding.UTF8.GetBytes(openMsg);
+                    await ws.SendAsync(new ArraySegment<byte>(openBytes),
+                        System.Net.WebSockets.WebSocketMessageType.Text, true, ct);
+                    var buf = new byte[512 * 1024];
                     while (ws.State == System.Net.WebSockets.WebSocketState.Open && !ct.IsCancellationRequested)
                     {
-                        var result = await ws.ReceiveAsync(new ArraySegment<byte>(buf), ct);
-                        if (result.MessageType == System.Net.WebSockets.WebSocketMessageType.Close) break;
-                        string text = System.Text.Encoding.UTF8.GetString(buf, 0, result.Count);
-                        onMessage(text);
+                        string msg = await ReceiveWsTextAsync(ws, buf, ct);
+                        if (msg == null) break;
+                        ProcessRemoteFrame(msg);
                     }
                 }
                 catch (OperationCanceledException) { break; }
@@ -1618,110 +1617,98 @@ namespace DshLauncher
             }
         }
 
-        private void ProcessEvent(string text)
+        /// <summary>完整读取一条 WS 文本消息（自动拼接分片）；Close 返回 null。</summary>
+        private static async Task<string> ReceiveWsTextAsync(System.Net.WebSockets.ClientWebSocket ws, byte[] buf, System.Threading.CancellationToken ct)
+        {
+            var sb = new System.Text.StringBuilder();
+            while (true)
+            {
+                var result = await ws.ReceiveAsync(new ArraySegment<byte>(buf), ct);
+                if (result.MessageType == System.Net.WebSockets.WebSocketMessageType.Close) return null;
+                sb.Append(System.Text.Encoding.UTF8.GetString(buf, 0, result.Count));
+                if (result.EndOfMessage) return sb.ToString();
+            }
+        }
+
+        /// <summary>
+        /// 处理 remote.mux 帧：{type:"item",value:{type:"ready"|"emit",...}}。
+        /// 启动器关心的事件（dsh-api-remotes 白名单）：
+        ///   api-session/activity [sessionId, time]  —— 会话有用户输入（主会话识别）
+        ///   api-session/status   [sessionId, running] —— 会话 agent 运行状态（false=任务结束）
+        ///   api-session/error    [sessionId, error]   —— 会话错误
+        ///   approval/request     [request](waterfall) —— 审批请求（需用户确认）
+        ///   user-questions/request                    —— 待回答问题
+        /// </summary>
+        private void ProcessRemoteFrame(string text)
         {
             try
             {
                 using var doc = JsonDocument.Parse(text);
                 var root = doc.RootElement;
-                if (!root.TryGetProperty("method", out var m)) return;
-                string method = m.GetString();
-                if (!root.TryGetProperty("payload", out var payload)) return;
+                if (!root.TryGetProperty("type", out var tEl) || tEl.GetString() != "item") return;
+                if (!root.TryGetProperty("value", out var v) || v.ValueKind != JsonValueKind.Object) return;
+                if (!v.TryGetProperty("type", out var vt)) return;
+                string vtype = vt.GetString();
+                if (vtype == "ready") { Log("事件流已就绪（$events）。"); return; }
+                if (vtype != "emit") return;
+                if (!v.TryGetProperty("event", out var evEl) || !v.TryGetProperty("args", out var args)
+                    || args.ValueKind != JsonValueKind.Array) return;
+                string evName = evEl.GetString();
+                switch (evName)
+                {
+                    case "api-session/activity":
+                        // 用户在该会话输入 → 识别为主会话（方案 B：只提醒主会话）
+                        if (args.GetArrayLength() > 0)
+                        {
+                            string sid = args[0].GetString() ?? "";
+                            if (!string.IsNullOrEmpty(sid)) _mainSession = sid;
+                        }
+                        break;
 
-                if (method == "approval/requested")
-                {
-                    // 需要用户确认：气泡 + 提示音（approvalId 去重）
-                    string id = payload.TryGetProperty("approvalId", out var a) ? a.GetString() : "";
-                    if (!string.IsNullOrEmpty(id) && !_notifiedApprovals.Add(id)) return;
-                    if (_notifiedApprovals.Count > 200) _notifiedApprovals.Clear();
-                    string tool = payload.TryGetProperty("toolName", out var t) ? t.GetString() : "?";
-                    string reason = payload.TryGetProperty("reason", out var r) ? r.GetString() : "";
-                    Notify("需要你的确认", "工具：" + tool + "\n" + Shorten(reason, 80));
-                }
-                else if (method == "session/event")
-                {
-                    // 回合事件：任务完成监听（turn/end）+ 最终答复摘要（assistant/message）
-                    ProcessSessionEvent(payload);
+                    case "api-session/status":
+                        // agent 运行状态变化：true=开始处理，false=任务结束（含子代理会话，用主会话过滤）
+                        if (args.GetArrayLength() >= 2)
+                        {
+                            string sid = args[0].GetString() ?? "";
+                            bool running = args[1].ValueKind == JsonValueKind.True;
+                            if (running)
+                            {
+                                _runningSessions.Add(sid);
+                            }
+                            else if (_runningSessions.Remove(sid) && sid == _mainSession)
+                            {
+                                Notify("任务已完成", "会话任务已执行完毕。");
+                            }
+                        }
+                        break;
+
+                    case "api-session/error":
+                        if (args.GetArrayLength() >= 2 && args[0].GetString() == _mainSession)
+                            Notify("任务失败", Shorten(args[1].GetRawText(), 120));
+                        break;
+
+                    case "approval/request":
+                        // waterfall：args[0] = 审批请求对象（字段随版本变化，尽力提取）
+                        if (args.GetArrayLength() > 0 && args[0].ValueKind == JsonValueKind.Object)
+                        {
+                            var req = args[0];
+                            string tool = req.TryGetProperty("toolName", out var tn) && tn.ValueKind == JsonValueKind.String ? tn.GetString() : null;
+                            string reason = req.TryGetProperty("reason", out var rs) && rs.ValueKind == JsonValueKind.String ? rs.GetString() : null;
+                            string body = (tool != null ? "工具：" + tool + "\n" : "") + (reason != null ? Shorten(reason, 80) : "");
+                            Notify("需要你的确认", string.IsNullOrWhiteSpace(body) ? "dsh 正在等待你的确认。" : body);
+                        }
+                        else
+                        {
+                            Notify("需要你的确认", "dsh 正在等待你的确认。");
+                        }
+                        break;
+
+                    case "user-questions/request":
+                        Notify("有待回答的问题", "dsh 正在等待你回答问题。");
+                        break;
                 }
             }
             catch { }
-        }
-
-        /// <summary>
-        /// 回合级任务完成监听：以「回合结束（turn/end）」为准，不再按 job 状态转变弹通知。
-        /// 原因：session/jobs 快照包含所有工具调用/子代理 job（线缆无父子关系字段），
-        /// 且 job 在子进程退出时即结算、早于模型最终答复，两者都会造成误报与提前。
-        /// </summary>
-        private void ProcessSessionEvent(JsonElement payload)
-        {
-            string sessionId = payload.TryGetProperty("sessionId", out var sidEl) ? sidEl.GetString() ?? "" : "";
-            if (!payload.TryGetProperty("event", out var ev) || ev.ValueKind != JsonValueKind.Object) return;
-            string etype = ev.TryGetProperty("type", out var t) ? t.GetString() : "";
-            if (!ev.TryGetProperty("data", out var data) || data.ValueKind != JsonValueKind.Object) return;
-
-            if (etype == "user/message")
-            {
-                // 主会话识别：用户主动输入消息的会话即主会话（子代理由 dsh 内部驱动，无 user/message）。
-                // 只提醒主会话的回合完成，从而自然过滤掉子代理（兼容 dsh 未来格式变化，不依赖会话列表）。
-                if (!string.IsNullOrEmpty(sessionId)) _mainSession = sessionId;
-            }
-            else if (etype == "assistant/message")
-            {
-                // 记录该会话最近一条模型答复，回合结束时作为「任务已完成」摘要
-                if (data.TryGetProperty("message", out var msg)
-                    && msg.TryGetProperty("content", out var content) && content.ValueKind == JsonValueKind.Array)
-                {
-                    var sb = new System.Text.StringBuilder();
-                    foreach (var block in content.EnumerateArray())
-                    {
-                        if (block.ValueKind == JsonValueKind.Object
-                            && block.TryGetProperty("text", out var txt) && txt.ValueKind == JsonValueKind.String)
-                            sb.Append(txt.GetString());
-                    }
-                    string text = sb.ToString();
-                    if (!string.IsNullOrWhiteSpace(text))
-                    {
-                        if (_lastAssistantText.Count > 100) _lastAssistantText.Clear();
-                        _lastAssistantText[sessionId] = text;
-                    }
-                }
-            }
-            else if (etype == "turn/start")
-            {
-                // 新回合开始，清掉上一回合的旧摘要，避免串台
-                _lastAssistantText.Remove(sessionId);
-            }
-            else if (etype == "turn/end")
-            {
-                // 只提醒主会话（最近有用户输入的会话）的回合完成；子代理/其他会话不打扰。
-                // 尚未识别到主会话（用户还没在当前会话发过消息）时，暂时不提醒，避免子代理误报。
-                if (_mainSession == null || sessionId != _mainSession) return;
-
-                string reasonKind = "";
-                string errorMessage = "";
-                if (data.TryGetProperty("reason", out var reason) && reason.ValueKind == JsonValueKind.Object)
-                {
-                    reasonKind = reason.TryGetProperty("kind", out var k) ? k.GetString() ?? "" : "";
-                    if (reasonKind == "error"
-                        && reason.TryGetProperty("error", out var err) && err.ValueKind == JsonValueKind.Object
-                        && err.TryGetProperty("message", out var em))
-                        errorMessage = em.GetString() ?? "";
-                }
-                string summary = _lastAssistantText.TryGetValue(sessionId, out var s) ? s : "";
-                switch (reasonKind)
-                {
-                    case "completed":
-                        Notify("任务已完成", string.IsNullOrEmpty(summary) ? "本轮任务已完成。" : Shorten(summary, 80));
-                        break;
-                    case "error":
-                        Notify("任务失败", string.IsNullOrEmpty(errorMessage) ? "本轮任务出错。" : Shorten(errorMessage, 80));
-                        break;
-                    case "aborted":
-                        Notify("任务已取消", "本轮任务被取消。");
-                        break;
-                    // blocked / max-tokens / interrupted 等不弹通知
-                }
-            }
         }
 
         private static string Shorten(string s, int max)
