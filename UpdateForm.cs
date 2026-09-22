@@ -108,15 +108,17 @@ namespace DshLauncher
         }
 
         /// <summary>后台检查是否有新版；完成后更新界面状态。
-        /// 带 15s 总超时：无网络/慢网络时不至于让更新窗口长时间卡住（按检查失败处理，进入主界面）。</summary>
+        /// 是否检查预发布版本跟随「提示预发布更新」选项（启动时与手动检查口径一致）。
+        /// 带 18s 总超时（版本检查内部另有 15s 预算）：无网络/慢网络时不至于让更新窗口长时间卡住。</summary>
         private async Task CheckForUpdatesAsync()
         {
             string result = null;
             try
             {
-                var check = Task.Run(MainForm.CheckVersionRemote);
+                bool prerelease = MainForm.NotifyPrereleaseUpdate;
+                var check = Task.Run(() => MainForm.CheckVersionRemote(prerelease, Log));
                 // 若网络不通，多个候选源逐个超时会拖很久；这里限制总等待时长
-                var done = await Task.WhenAny(check, Task.Delay(15000)) == check;
+                var done = await Task.WhenAny(check, Task.Delay(18000)) == check;
                 if (done) result = await check;
             }
             catch
@@ -135,12 +137,21 @@ namespace DshLauncher
             if (result != null && result != "latest")
             {
                 _remoteVersion = result;
+                // 顶部标签高度有限（AutoSize=false），长文案会被裁掉看不清；
+                // 这里只放两行摘要，完整信息写入下方日志（日志可滚动查看）。
                 _lblInfo.Text = "发现新版本 " + _remoteVersion + "（本地 " + _localVersion + "）\n" +
-                    "更新将执行 npm install -g @deepseek-ai/dsh；你的聊天记录与 userdata 数据不受影响。";
+                    "点「立即更新」自动安装，详情见下方日志。";
                 _btnUpdate.Enabled = true;
                 _btnSkip.Enabled = true;
                 SetStep("发现新版本，可点击「立即更新」", _progress.Minimum);
-                Log("发现新版本：" + result + "（本地 " + _localVersion + "）");
+                Log("──────── 检测到新版本 ────────");
+                Log("发现新版本：" + _remoteVersion + "（本地 " + _localVersion + "）");
+                Log("更新命令：npm install -g @deepseek-ai/dsh@" + _remoteVersion);
+                Log("版本通道：" + (MainForm.NotifyPrereleaseUpdate
+                    ? "含预发布通道（npm latest/next/alpha + 官方仓库 master）"
+                    : "仅 npm latest 正式通道"));
+                Log("说明：只替换 dsh 运行包，聊天记录与 userdata 用户数据不受影响。");
+                Log("提示：若该版本尚未发布到 npm，会自动降级安装 npm 上的最新发布版。");
                 return;
             }
             // 无新版或检查失败：简短展示结果后自动进入主界面
@@ -227,15 +238,34 @@ namespace DshLauncher
             // 停止 dsh 服务（避免更新后旧进程使用旧包）
             if (!await StopDshServiceIfRunningAsync()) return false;
 
-            SetStep("正在更新 dsh（npm install -g @deepseek-ai/dsh）...", 30);
-            Log("运行：" + _node + " " + npmCli + " install -g @deepseek-ai/dsh");
-            bool ok = await RunNpmGlobalAsync(_node, npmCli, prefix,
-                "install -g @deepseek-ai/dsh", 600);
-            if (!ok) throw new Exception("npm install -g @deepseek-ai/dsh 失败（请查看上方日志或检查网络）");
+            // 更新到「检测到的那个版本」而不是 npm latest 标签：
+            // 勾选「提示预发布更新」时目标可能是仓库 master 上的 alpha（比 latest 新），
+            // 若仍装 latest 会装回旧版 → 每次启动重复提示同一新版（死循环）。
+            string target = (!string.IsNullOrEmpty(_remoteVersion) && _remoteVersion != "latest")
+                ? _remoteVersion : null;
+            string spec = "@deepseek-ai/dsh";
+            if (target != null)
+            {
+                if (MainForm.NpmVersionExists(target))
+                {
+                    spec += "@" + target;
+                }
+                else
+                {
+                    Log("提示：目标版本 " + target + " 尚未发布到 npm（可能只在官方仓库中），改为安装 npm 上的最新发布版。");
+                }
+            }
+
+            SetStep("正在更新 dsh（npm install -g " + spec + "）...", 30);
+            Log("运行：" + _node + " " + npmCli + " install -g " + spec);
+            bool ok = await RunNpmGlobalAsync(_node, npmCli, prefix, "install -g " + spec, 600);
+            if (!ok) throw new Exception("npm install -g " + spec + " 失败（请查看上方日志或检查网络）");
 
             string newVer = MainForm.LocalVersion;   // 重新读取全局包版本
             SetStep("更新完成", 100);
             Log("更新完成！当前 dsh 版本：" + newVer);
+            if (target != null && newVer != target)
+                Log("注意：安装后版本为 " + newVer + "，与目标版本 " + target + " 不一致（可重试或在终端手动执行 npm install -g " + spec + "）。");
             MessageBox.Show("dsh 更新完成（版本 " + newVer + "）！\n即将进入主界面。", "更新成功",
                 MessageBoxButtons.OK, MessageBoxIcon.Information);
             Completed = true;

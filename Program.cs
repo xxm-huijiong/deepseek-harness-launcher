@@ -124,7 +124,9 @@ namespace DshLauncher
         private Button _btnExit;             // 退出程序
         private CheckBox _chkAutoStart;
         private CheckBox _chkAutoCheck;      // 启动时检查更新
+        private CheckBox _chkPrerelease;     // 提示预发布更新（勾选=额外跟 npm alpha/next 与仓库 master）
         private CheckBox _chkNotify;         // 任务提醒（等待确认/任务完成时气泡+提示音）
+        private readonly ToolTip _tip = new ToolTip();   // 选项说明（悬停提示）
         private CheckBox _chkBackOnly;       // 后台才提醒（窗口在前端时不弹通知，需勾选任务提醒才生效）
         private CheckBox _chkEmbedded;       // 启动时用内置浏览器打开（取消则用系统浏览器，服务就绪后缩到托盘）
 
@@ -145,6 +147,7 @@ namespace DshLauncher
         private ToolStripMenuItem _menuStop;    // 托盘菜单：停止服务
         private ToolStripMenuItem _menuAutoStart; // 托盘菜单选项：启动时自动运行
         private ToolStripMenuItem _menuAutoCheck; // 托盘菜单选项：启动时检查更新
+        private ToolStripMenuItem _menuPrerelease; // 托盘菜单选项：提示预发布更新
         private ToolStripMenuItem _menuNotify;    // 托盘菜单选项：任务提醒
         private ToolStripMenuItem _menuBackOnly;  // 托盘菜单选项：后台才提醒
         private ToolStripMenuItem _menuEmbedded;  // 托盘菜单选项：启动时用内置浏览器打开
@@ -219,6 +222,10 @@ namespace DshLauncher
             // 持久化由复选框自己的 CheckedChanged 处理（SyncCheckbox 设置后自动触发）
             _menuAutoCheck.CheckedChanged += (s, e) => SyncCheckbox(_chkAutoCheck, _menuAutoCheck.Checked);
             trayMenu.Items.Add(_menuAutoCheck);
+
+            _menuPrerelease = new ToolStripMenuItem("提示预发布更新") { CheckOnClick = true, Checked = NotifyPrereleaseUpdate };
+            _menuPrerelease.CheckedChanged += (s, e) => SyncCheckbox(_chkPrerelease, _menuPrerelease.Checked);
+            trayMenu.Items.Add(_menuPrerelease);
 
             _menuNotify = new ToolStripMenuItem("任务提醒") { CheckOnClick = true, Checked = true };
             _menuNotify.CheckedChanged += (s, e) => SyncCheckbox(_chkNotify, _menuNotify.Checked);
@@ -311,10 +318,27 @@ namespace DshLauncher
                 if (_menuAutoCheck != null) _menuAutoCheck.Checked = _chkAutoCheck.Checked;
                 CheckUpdateOnStart = _chkAutoCheck.Checked; SaveConfig();
             };
+            _actionsPanel.Controls.Add(_chkPrerelease = new CheckBox
+            {
+                Text = "提示预发布更新",
+                Location = new Point(298, 42),
+                Size = new Size(148, 22),
+                Checked = NotifyPrereleaseUpdate,
+                Font = new Font(Font.FontFamily, 9f)
+            });
+            _chkPrerelease.CheckedChanged += (s, e) =>
+            {
+                if (_menuPrerelease != null) _menuPrerelease.Checked = _chkPrerelease.Checked;
+                NotifyPrereleaseUpdate = _chkPrerelease.Checked; SaveConfig();
+            };
+            _tip.SetToolTip(_chkPrerelease,
+                "勾选：也提示 alpha / next 等预发布版本（跟随官方仓库 master，可能比 npm latest 更新）\n" +
+                "取消：只跟随 npm latest 正式通道。\n" +
+                "启动时检查与手动「检查更新」都按此选项执行。");
             _actionsPanel.Controls.Add(_chkNotify = new CheckBox
             {
                 Text = "任务提醒",
-                Location = new Point(300, 42),
+                Location = new Point(452, 42),
                 Size = new Size(80, 22),
                 Checked = true,
                 Font = new Font(Font.FontFamily, 9f)
@@ -323,7 +347,7 @@ namespace DshLauncher
             _actionsPanel.Controls.Add(_chkBackOnly = new CheckBox
             {
                 Text = "后台才提醒",
-                Location = new Point(390, 42),
+                Location = new Point(540, 42),
                 Size = new Size(110, 22),
                 Checked = true,
                 Font = new Font(Font.FontFamily, 9f)
@@ -332,8 +356,8 @@ namespace DshLauncher
             _actionsPanel.Controls.Add(_chkEmbedded = new CheckBox
             {
                 Text = "内置浏览器打开",
-                Location = new Point(508, 42),
-                Size = new Size(150, 22),
+                Location = new Point(658, 42),
+                Size = new Size(135, 22),
                 Checked = UseEmbeddedBrowser,
                 Font = new Font(Font.FontFamily, 9f)
             });
@@ -560,6 +584,7 @@ namespace DshLauncher
             _bootWatchTimer.Stop();
             StopServer();
             try { _trayIcon.Visible = false; _trayIcon.Dispose(); } catch { }
+            try { _tip.Dispose(); } catch { }
             try { _web?.Dispose(); } catch { }
             try { _http.Dispose(); } catch { }
         }
@@ -969,6 +994,7 @@ namespace DshLauncher
 
         // ── 配置与首次安装引导 ────────────────────────────────────
         internal static bool CheckUpdateOnStart = true;   // 启动时检查更新（config.json 持久化）
+        internal static bool NotifyPrereleaseUpdate = true;  // 提示预发布更新（勾选=额外跟 npm alpha/next 与仓库 master；config.json 持久化）
         internal static bool UseEmbeddedBrowser = true;   // 启动时用内置浏览器打开（false=让 dsh 开系统浏览器，服务就绪后启动器缩到托盘）
 
         internal static void LoadConfig()
@@ -988,6 +1014,8 @@ namespace DshLauncher
                     }
                     if (doc.RootElement.TryGetProperty("checkUpdate", out var cu) && cu.ValueKind == JsonValueKind.False)
                         CheckUpdateOnStart = false;
+                    if (doc.RootElement.TryGetProperty("notifyPrerelease", out var np) && np.ValueKind == JsonValueKind.False)
+                        NotifyPrereleaseUpdate = false;
                     if (doc.RootElement.TryGetProperty("useEmbeddedBrowser", out var ue) && ue.ValueKind == JsonValueKind.False)
                         UseEmbeddedBrowser = false;
                 }
@@ -1011,7 +1039,7 @@ namespace DshLauncher
             try
             {
                 File.WriteAllText(ConfigFile,
-                    JsonSerializer.Serialize(new { workDir = WorkDir, checkUpdate = CheckUpdateOnStart, useEmbeddedBrowser = UseEmbeddedBrowser }, new JsonSerializerOptions { WriteIndented = true }));
+                    JsonSerializer.Serialize(new { workDir = WorkDir, checkUpdate = CheckUpdateOnStart, notifyPrerelease = NotifyPrereleaseUpdate, useEmbeddedBrowser = UseEmbeddedBrowser }, new JsonSerializerOptions { WriteIndented = true }));
             }
             catch { }
         }
@@ -1224,15 +1252,18 @@ namespace DshLauncher
             return (null, null);
         }
 
+        /// <summary>按 PATH 查找可执行文件（传入 "node" 自动补 .exe；传入 "dsh.cmd"/"npm.cmd" 等带扩展名的名字则原样查找）。</summary>
         internal static string ResolveFromPath(string name)
         {
             try
             {
+                // 旧实现无条件拼 ".exe"，导致 "dsh.cmd"/"pnpm.cmd"/"npm.cmd" 实际查的是 xxx.cmd.exe → 永远找不到
+                string fileName = name.IndexOf('.') >= 0 ? name : name + ".exe";
                 string path = Environment.GetEnvironmentVariable("PATH") ?? "";
                 foreach (var dir in path.Split(';'))
                 {
                     if (string.IsNullOrEmpty(dir)) continue;
-                    string full = Path.Combine(dir.Trim('"'), name + ".exe");
+                    string full = Path.Combine(dir.Trim('"'), fileName);
                     if (File.Exists(full)) return full;
                 }
             }
@@ -1456,20 +1487,20 @@ namespace DshLauncher
                 || ext.Equals(".bmp", StringComparison.OrdinalIgnoreCase);
         }
 
-        // ── 更新检查（版本对比：本地 package.json vs GitHub 官方仓库） ──
+        // ── 更新检查（版本对比：本地全局包版本 vs npm latest / 仓库 master） ──
         private async Task CheckForUpdatesAsync(bool interactive)
         {
-            Log("正在检查更新 ...");
-            var result = await Task.Run(() => CheckVersionRemote());
+            Log("正在检查更新（" + (NotifyPrereleaseUpdate ? "含预发布通道" : "仅正式通道") + "）...");
+            var result = await Task.Run(() => CheckVersionRemote(NotifyPrereleaseUpdate, Log));
 
             if (result == null)
             {
                 if (interactive)
                 {
-                    MessageBox.Show("无法检查更新（网络或 GitHub 仓库不可达）。",
+                    MessageBox.Show("无法检查更新（网络不可达，或官方 npm / GitHub 源均不可用）。",
                         "检查更新", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 }
-                Log("检查更新失败（网络不可达）。");
+                Log("检查更新失败（所有源不可用）。");
                 return;
             }
 
@@ -1487,7 +1518,7 @@ namespace DshLauncher
             Log("发现新版本：" + result + "（本地 " + LocalVersion + "）");
             var r = MessageBox.Show(
                 "发现新版本 " + result + "（本地 " + LocalVersion + "）。\n\n" +
-                "【是】立即自动更新（停服 → 更新源码 → 重装依赖并构建 → 重启服务）\n" +
+                "【是】立即自动更新（停服 → npm install -g @deepseek-ai/dsh@" + result + " → 重启服务）\n" +
                 "【否】只打开 GitHub 仓库手动处理",
                 "发现更新", MessageBoxButtons.YesNoCancel, MessageBoxIcon.Information);
             if (r == DialogResult.Cancel) return;
@@ -1736,36 +1767,160 @@ namespace DshLauncher
         }
 
         /// <summary>
-        /// 返回 "latest" 表示无更新；返回版本号表示远程新版本；null 表示检查失败。
-        /// 多候选源依次尝试：raw GitHub → ghproxy 镜像 → npm registry → 国内 npm 镜像；
-        /// 自动读取 HTTPS_PROXY/HTTP_PROXY 环境变量（兼容代理环境，不影响系统设置）。
+        /// 检查远程最新版本。返回 "latest" 表示无更新；返回版本号表示远程新版本；null 表示检查失败。
+        /// 通道 A（始终启用）：npm「latest」标签（registry.npmjs.org → npmmirror 镜像），即正式通道。
+        /// 通道 B（仅「提示预发布更新」勾选时）：官方仓库 master 的 package.json + npm dist-tags（next/alpha），
+        ///   故可能提示比 npm latest 更新的预发布版本（如 0.1.6-alpha.2）。
+        /// 每个源都先走系统代理、失败再直连（并写入日志），兼容“系统代理可用/只能直连”两类环境；
+        /// 总预算 15 秒，超时不再尝试剩余源（避免启动时更新窗口久等）。
         /// </summary>
-        internal static string CheckVersionRemote()
+        internal static string CheckVersionRemote(bool includePrerelease, Action<string> log = null)
         {
-            var candidates = new[]
+            Action<string> note = log != null
+                ? (Action<string>)(m => { try { log(m); } catch { } })
+                : (m => StaticLog(m));
+            var budget = Stopwatch.StartNew();
+            const int perRequestSec = 5;    // 单个源单次尝试的超时
+            const int budgetSec = 15;       // 检查总预算
+            Func<bool> inBudget = () => budget.Elapsed.TotalSeconds < budgetSec;
+
+            string latest = FirstAvailableVersion(new[]
             {
-                "https://raw.githubusercontent.com/deepseek-ai/deepseek-harness/main/package.json",
-                "https://ghproxy.net/https://raw.githubusercontent.com/deepseek-ai/deepseek-harness/main/package.json",
                 "https://registry.npmjs.org/@deepseek-ai/dsh/latest",
                 "https://registry.npmmirror.com/@deepseek-ai/dsh/latest"
-            };
-            foreach (var url in candidates)
+            }, "npm latest 通道", note, perRequestSec, inBudget);
+
+            string prerelease = null;
+            if (includePrerelease)
             {
-                string json = TryFetchText(url, 8);
-                if (json == null) continue;
-                try
+                // 仓库 master（官方默认分支；旧写 main 会 404，故 main 仅作兜底）+ ghproxy 镜像
+                string repo = FirstAvailableVersion(new[]
                 {
-                    using var doc = JsonDocument.Parse(json);
-                    if (doc.RootElement.TryGetProperty("version", out var v))
-                    {
-                        string remote = v.GetString();
-                        if (!string.IsNullOrEmpty(remote))
-                            return IsRemoteNewer(LocalVersion, remote) ? remote : "latest";
-                    }
+                    "https://raw.githubusercontent.com/deepseek-ai/deepseek-harness/master/package.json",
+                    "https://raw.githubusercontent.com/deepseek-ai/deepseek-harness/main/package.json",
+                    "https://ghproxy.net/https://raw.githubusercontent.com/deepseek-ai/deepseek-harness/master/package.json"
+                }, "预发布-仓库", note, perRequestSec, inBudget);
+                // npm dist-tags（{"latest":..,"next":..,"alpha":..}：取其中最高版本）
+                string tags = FirstAvailableVersion(new[]
+                {
+                    "https://registry.npmjs.org/-/package/@deepseek-ai/dsh/dist-tags",
+                    "https://registry.npmmirror.com/-/package/@deepseek-ai/dsh/dist-tags"
+                }, "预发布-npm tag", note, perRequestSec, inBudget);
+                prerelease = MaxVersion(repo, tags);
+            }
+
+            string remote = MaxVersion(latest, prerelease);
+            if (remote == null)
+            {
+                note("版本检查：所有源均不可用，检查失败。");
+                return null;
+            }
+            note("版本检查：远程最新 " + remote + "（本地 " + LocalVersion +
+                (includePrerelease ? "，含预发布通道" : "，仅 npm latest 通道") + "）。");
+            return IsRemoteNewer(LocalVersion, remote) ? remote : "latest";
+        }
+
+        /// <summary>依次抓取候选源，返回第一个能解析出版本号的结果；全部失败或在预算外返回 null。</summary>
+        private static string FirstAvailableVersion(string[] urls, string label, Action<string> note, int timeoutSec, Func<bool> inBudget)
+        {
+            foreach (var url in urls)
+            {
+                if (inBudget != null && !inBudget())
+                {
+                    note(label + "：已超出检查时限，跳过剩余源。");
+                    return null;
                 }
-                catch { }
+                string host = UrlHost(url);
+                string json = FetchTextBoth(url, timeoutSec, note, label + " @ " + host);
+                if (json == null) continue;
+                string ver;
+                try { ver = ExtractVersion(json); }
+                catch (Exception ex)
+                {
+                    note(label + " @ " + host + "：解析失败（" + ex.Message + "）。");
+                    continue;
+                }
+                if (string.IsNullOrEmpty(ver))
+                {
+                    note(label + " @ " + host + "：响应中没有版本号。");
+                    continue;
+                }
+                note(label + " 命中：" + ver + "（" + host + "）");
+                return ver;
             }
             return null;
+        }
+
+        private static string UrlHost(string url)
+        {
+            try { return new Uri(url).Host; } catch { return url; }
+        }
+
+        /// <summary>从 package.json（version 字段）或 npm dist-tags（{tag:版本}）JSON 中取版本号；后者取其中最高版本。</summary>
+        private static string ExtractVersion(string json)
+        {
+            using var doc = JsonDocument.Parse(json);
+            var root = doc.RootElement;
+            if (root.ValueKind != JsonValueKind.Object) return null;
+            if (root.TryGetProperty("version", out var v) && v.ValueKind == JsonValueKind.String)
+                return v.GetString();
+            string best = null;
+            foreach (var p in root.EnumerateObject())
+            {
+                if (p.Value.ValueKind != JsonValueKind.String) continue;
+                string s = p.Value.GetString();
+                if (string.IsNullOrEmpty(s) || !Regex.IsMatch(s, @"^\d+\.\d+\.\d+")) continue;   // 过滤非版本值
+                best = MaxVersion(best, s);
+            }
+            return best;
+        }
+
+        /// <summary>抓取文本：先走系统代理、失败再直连；两者都失败返回 null（过程与原因写入日志）。</summary>
+        private static string FetchTextBoth(string url, int timeoutSec, Action<string> note, string label)
+        {
+            foreach (bool useProxy in new[] { true, false })
+            {
+                try
+                {
+                    using var client = CreateHttpClient(timeoutSec, useProxy);
+                    string text = client.GetStringAsync(url).GetAwaiter().GetResult();
+                    note(label + "：" + (useProxy ? "系统代理" : "直连") + "成功。");
+                    return text;
+                }
+                catch (Exception ex)
+                {
+                    note(label + "：" + (useProxy ? "系统代理" : "直连") + "失败（" + Shorten(ex.Message, 100) + "）。");
+                }
+            }
+            return null;
+        }
+
+        /// <summary>取两个版本号中较新者（null 视为无值）。</summary>
+        private static string MaxVersion(string a, string b)
+        {
+            if (string.IsNullOrEmpty(a)) return b;
+            if (string.IsNullOrEmpty(b)) return a;
+            return CompareVersions(a, b) >= 0 ? a : b;
+        }
+
+        /// <summary>判断 npm 上是否存在指定版本（仓库 master 的版本可能尚未发布到 npm，避免安装直接失败）。</summary>
+        internal static bool NpmVersionExists(string version)
+        {
+            if (string.IsNullOrEmpty(version)) return false;
+            string url = "https://registry.npmjs.org/@deepseek-ai/dsh/" + version;
+            string json = FetchTextBoth(url, 5, m => StaticLog(m), "npm 版本确认 @ " + version);
+            return !string.IsNullOrEmpty(json);
+        }
+
+        /// <summary>写日志文件（静态上下文用，无需 UI 句柄）。</summary>
+        internal static void StaticLog(string message)
+        {
+            try
+            {
+                File.AppendAllText(LogFile,
+                    "[" + DateTime.Now.ToString("HH:mm:ss") + "] " + message + Environment.NewLine);
+            }
+            catch { }
         }
 
         /// <summary>
@@ -1834,20 +1989,6 @@ namespace DshLauncher
             client.DefaultRequestHeaders.UserAgent.ParseAdd(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36");
             return client;
-        }
-
-        /// <summary>带代理感知的短超时抓取；失败返回 null。</summary>
-        private static string TryFetchText(string url, int timeoutSec)
-        {
-            try
-            {
-                using var client = CreateHttpClient(timeoutSec);
-                return client.GetStringAsync(url).GetAwaiter().GetResult();
-            }
-            catch
-            {
-                return null;
-            }
         }
 
         // ── 外部浏览器：自动探测现代浏览器（Edge/Chrome/Firefox），不再依赖系统默认关联 ──
