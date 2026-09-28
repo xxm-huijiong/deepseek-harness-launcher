@@ -136,6 +136,8 @@ namespace DshLauncher
         private readonly HashSet<string> _runningSessions = new();      // agent 运行中的会话（running → false 即任务结束）
         private long _remoteStreamSeq;                                  // remote.mux 逻辑流编号
         private bool _eventMonitorStarted;
+        private System.Net.WebSockets.ClientWebSocket _eventWs;         // 当前事件连接（用于长时间静默后的主动重连）
+        private DateTime _eventWsConnectedAt;
 
         private Panel _logPanel;             // 底部日志面板（默认收起）
         private TextBox _logBox;
@@ -143,6 +145,7 @@ namespace DshLauncher
         private WebView2 _web;
         private PictureBox _splash;          // 启动画面（等待期随机图片）
         private NotifyIcon _trayIcon;        // 系统托盘图标
+        private ToastForm _toast;            // 自绘提醒窗（右下角，不依赖 Windows 通知设置）
         private ToolStripMenuItem _menuStart;   // 托盘菜单：启动服务
         private ToolStripMenuItem _menuStop;    // 托盘菜单：停止服务
         private ToolStripMenuItem _menuAutoStart; // 托盘菜单选项：启动时自动运行
@@ -210,6 +213,7 @@ namespace DshLauncher
             trayMenu.Items.Add("备份数据", null, (s, e) => BackupData());
             trayMenu.Items.Add("检查更新", null, (s, e) => CheckForUpdates(interactive: true));
             trayMenu.Items.Add("修复浏览器", null, (s, e) => _ = TryInstallWebView2Async());
+            trayMenu.Items.Add("测试提醒", null, (s, e) => TestNotify());
             trayMenu.Items.Add("选择 dsh 目录", null, (s, e) => ChooseDshDirectoryFromMain());
 
             // ── 选项组（勾选，与主窗口操作栏复选框同步） ──────────
@@ -226,6 +230,7 @@ namespace DshLauncher
             _menuPrerelease = new ToolStripMenuItem("提示预发布更新") { CheckOnClick = true, Checked = NotifyPrereleaseUpdate };
             _menuPrerelease.CheckedChanged += (s, e) => SyncCheckbox(_chkPrerelease, _menuPrerelease.Checked);
             trayMenu.Items.Add(_menuPrerelease);
+
 
             _menuNotify = new ToolStripMenuItem("任务提醒") { CheckOnClick = true, Checked = true };
             _menuNotify.CheckedChanged += (s, e) => SyncCheckbox(_chkNotify, _menuNotify.Checked);
@@ -556,9 +561,10 @@ namespace DshLauncher
                 if (!_trayNotified)
                 {
                     _trayNotified = true;
-                    _trayIcon.ShowBalloonTip(2500, "dsh-launcher",
-                        "已最小化到系统托盘，服务仍在后台运行。\n右键托盘图标可退出。",
-                        ToolTipIcon.Info);
+                    // 系统气泡在部分机器上会被 Windows 静默丢弃，统一走「气泡 + 自绘窗兜底」的提醒链路
+                    ShowReminder("已最小化到系统托盘",
+                        "服务仍在后台运行。\n双击托盘图标可恢复窗口，右键可操作或退出。",
+                        playSound: false);
                 }
                 return;
             }
@@ -585,6 +591,7 @@ namespace DshLauncher
             StopServer();
             try { _trayIcon.Visible = false; _trayIcon.Dispose(); } catch { }
             try { _tip.Dispose(); } catch { }
+            try { _toast?.Close(); _toast?.Dispose(); } catch { }
             try { _web?.Dispose(); } catch { }
             try { _http.Dispose(); } catch { }
         }
@@ -767,9 +774,9 @@ namespace DshLauncher
             if (!_trayNotified)
             {
                 _trayNotified = true;
-                _trayIcon.ShowBalloonTip(2500, "dsh-launcher",
-                    "服务已启动，已在系统浏览器打开。\n启动器已最小化到托盘，右键托盘图标可操作。",
-                    ToolTipIcon.Info);
+                ShowReminder("服务已启动",
+                    "已在系统浏览器打开，启动器已最小化到托盘。\n右键托盘图标可操作。",
+                    playSound: false);
             }
         }
 
@@ -861,7 +868,7 @@ namespace DshLauncher
 
             if (ready)
             {
-                _statusLabel.Text = "● 运行中  http://127.0.0.1:" + Port + "/web/";
+                _statusLabel.Text = "● 运行中  http://127.0.0.1:" + Port + "/";
                 _statusLabel.ForeColor = Color.FromArgb(0, 140, 0);
                 StartEventMonitor();   // 任务提醒（含外部实例就绪的场景）
             }
@@ -876,6 +883,20 @@ namespace DshLauncher
                 _statusLabel.ForeColor = Color.FromArgb(120, 120, 120);
                 _uiLoaded = false;
             }
+            // 长时间静默的事件连接可能已半死（对端/系统静默断开时本地不报错、也不会触发重连）：
+            // 无任务在跑时每 30 分钟主动重连一次，避免「提醒静默失效」。
+            try
+            {
+                var wsSnap = _eventWs;
+                if (wsSnap != null && _runningSessions.Count == 0 &&
+                    DateTime.Now - _eventWsConnectedAt > TimeSpan.FromMinutes(30))
+                {
+                    _eventWsConnectedAt = DateTime.Now;   // 先刷新时间戳，避免每秒重复触发
+                    Log("事件监听静默已超 30 分钟且无任务在跑，主动重连一次（防连接静默失效）。");
+                    wsSnap.Abort();
+                }
+            }
+            catch { }
             try { _trayIcon.Text = "dsh-launcher - " + _statusLabel.Text.Replace("● ", ""); } catch { }
             try
             {
@@ -1623,7 +1644,11 @@ namespace DshLauncher
                 {
                     using var ws = new System.Net.WebSockets.ClientWebSocket();
                     ws.Options.Cookies = AuthCookies;      // 携带 dsh 鉴权 Cookie
+                    // 每 20 秒发一次 WS ping：链路保持活跃，且底层能更早发现断线（dsh 的 ws 服务端会自动回 pong）
+                    ws.Options.KeepAliveInterval = TimeSpan.FromSeconds(20);
                     await ws.ConnectAsync(new Uri(WsUrl("/api/remote.mux")), ct);
+                    _eventWs = ws;
+                    _eventWsConnectedAt = DateTime.Now;
                     Log(name + "已连接。");
                     // 打开 $events 逻辑流（payload 必须是 {"args":{}}）
                     string streamId = "launcher-" + Interlocked.Increment(ref _remoteStreamSeq);
@@ -1693,6 +1718,7 @@ namespace DshLauncher
                         {
                             string sid = args[0].GetString() ?? "";
                             if (!string.IsNullOrEmpty(sid)) _mainSession = sid;
+                            Log("事件：主会话活动 " + ShortId(sid));
                         }
                         break;
 
@@ -1702,11 +1728,14 @@ namespace DshLauncher
                         {
                             string sid = args[0].GetString() ?? "";
                             bool running = args[1].ValueKind == JsonValueKind.True;
+                            bool isMain = sid == _mainSession;
+                            Log("事件：会话" + (running ? "开始运行 " : "结束运行 ") + ShortId(sid) +
+                                (isMain ? "（主会话）" : "（非主会话；当前主会话 " + ShortId(_mainSession) + "）"));
                             if (running)
                             {
                                 _runningSessions.Add(sid);
                             }
-                            else if (_runningSessions.Remove(sid) && sid == _mainSession)
+                            else if (_runningSessions.Remove(sid) && isMain)
                             {
                                 Notify("任务已完成", "会话任务已执行完毕。");
                             }
@@ -1714,11 +1743,17 @@ namespace DshLauncher
                         break;
 
                     case "api-session/error":
-                        if (args.GetArrayLength() >= 2 && args[0].GetString() == _mainSession)
-                            Notify("任务失败", Shorten(args[1].GetRawText(), 120));
+                        if (args.GetArrayLength() >= 2)
+                        {
+                            Log("事件：会话错误 " + ShortId(args[0].GetString() ?? "") +
+                                (args[0].GetString() == _mainSession ? "（主会话）" : "（非主会话）"));
+                            if (args[0].GetString() == _mainSession)
+                                Notify("任务失败", Shorten(args[1].GetRawText(), 120));
+                        }
                         break;
 
                     case "approval/request":
+                        Log("事件：审批请求（等待确认）");
                         // waterfall：args[0] = 审批请求对象（字段随版本变化，尽力提取）
                         if (args.GetArrayLength() > 0 && args[0].ValueKind == JsonValueKind.Object)
                         {
@@ -1735,6 +1770,7 @@ namespace DshLauncher
                         break;
 
                     case "user-questions/request":
+                        Log("事件：待回答问题（等待回答）");
                         Notify("有待回答的问题", "dsh 正在等待你回答问题。");
                         break;
                 }
@@ -1756,14 +1792,83 @@ namespace DshLauncher
                 if (!IsDisposed)
                     Invoke((Action)(() =>
                     {
-                        if (!_chkNotify.Checked) return;
+                        if (!_chkNotify.Checked)
+                        {
+                            Log("提醒未弹出：" + title + "（未勾选「任务提醒」）");
+                            return;
+                        }
                         // 「后台才提醒」：窗口在前端（用户正看着界面）时不弹通知
-                        if (_chkBackOnly.Checked && Form.ActiveForm == this) return;
-                        try { System.Media.SystemSounds.Exclamation.Play(); } catch { }
-                        try { _trayIcon.ShowBalloonTip(5000, "dsh-launcher - " + title, text, ToolTipIcon.Info); } catch { }
+                        if (_chkBackOnly.Checked && Form.ActiveForm == this)
+                        {
+                            Log("提醒未弹出：" + title + "（已勾选「后台才提醒」且启动器窗口当前在前端）");
+                            return;
+                        }
+                        ShowReminder(title, text);
                     }));
             }
             catch { }
+        }
+
+        /// <summary>
+        /// 弹出一次提醒：提示音 + 系统托盘气泡；若系统气泡没真正显示（Windows 通知被关/勿扰/横幅被限会静默丢弃），
+        /// 1.2 秒后用右下角自绘窗兜底，避免"提醒发出去但没人看到"。
+        /// 勾选「总是弹提醒窗」时两者都给（系统气泡不可靠的机器可强制兜底）。
+        /// </summary>
+        private void ShowReminder(string title, string text, bool playSound = true)
+        {
+            if (IsDisposed) return;
+            if (InvokeRequired) { Invoke((Action)(() => ShowReminder(title, text, playSound))); return; }
+            try { if (playSound) System.Media.SystemSounds.Exclamation.Play(); } catch { }
+
+            if (ShowToast(title, text))
+            {
+                Log("已提醒：" + title + "（右下角自绘提醒窗" + (playSound ? " + 提示音" : "") + "，立即弹出）");
+                return;
+            }
+            // 自绘窗创建失败（极端情况）才退回系统气泡，保证至少有一次提醒
+            try
+            {
+                _trayIcon.ShowBalloonTip(5000, "dsh-launcher - " + title, text, ToolTipIcon.Info);
+                Log("已提醒：" + title + "（自绘窗不可用，改用系统气泡）");
+            }
+            catch (Exception ex)
+            {
+                Log("提醒失败：" + title + " - " + ex.Message);
+            }
+        }
+
+        /// <summary>在屏幕右下角弹出自绘提醒窗（同一时刻只保留一个；不依赖 Windows 通知设置）。返回是否成功弹出。</summary>
+        private bool ShowToast(string title, string text)
+        {
+            try
+            {
+                if (IsDisposed) return false;
+                if (InvokeRequired) return (bool)Invoke((Func<bool>)(() => ShowToast(title, text)));
+                try { _toast?.Close(); } catch { }
+                _toast = new ToastForm(title, text, ShowMainWindow);
+                _toast.Show();
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Log("显示右下角提醒窗失败：" + ex.Message);
+                return false;
+            }
+        }
+
+        /// <summary>托盘菜单「测试提醒」：不受「任务提醒/后台才提醒」选项影响，走与任务提醒完全相同的链路，便于验证。</summary>
+        private void TestNotify()
+        {
+            Log("测试提醒：开始（随后会记录系统气泡是否真的显示）。");
+            ShowReminder("测试提醒",
+                "提醒链路测试：若只看到这个右下角小窗、系统没有气泡，说明 Windows 通知仍被限制（提醒会自动兜底）。");
+        }
+
+        /// <summary>会话 id 缩短显示，便于日志里比对（session-xxxxxxxx-… → 前 20 字符）。</summary>
+        private static string ShortId(string sid)
+        {
+            if (string.IsNullOrEmpty(sid)) return "(无)";
+            return sid.Length <= 20 ? sid : sid.Substring(0, 20) + "…";
         }
 
         /// <summary>
@@ -1932,12 +2037,21 @@ namespace DshLauncher
             return CompareVersions(local, remote) < 0;
         }
 
-        /// <summary>比较两个版本号：返回 &lt;0 表示 a 旧于 b，0 相同，&gt;0 表示 a 新于 b。</summary>
+        /// <summary>
+        /// 版本比较（符合 semver 预发布规则）：返回 &lt;0 表示 a 旧于 b，0 相同，&gt;0 表示 a 新于 b。
+        /// 1) 先比 major.minor.patch 数字；
+        /// 2) 无预发布段者更新（0.1.7 &gt; 0.1.7-rc.2）；
+        /// 3) 都有预发布段则按 "." 分段比较：纯数字段按数值比、数字段 &lt; 字母段、字母段按字典序（alpha &lt; beta &lt; rc）；
+        ///    前面全等时段数多者更新（alpha &lt; alpha.1）。
+        /// 例：0.1.7-alpha.2 &lt; 0.1.7-rc.1 &lt; 0.1.7-rc.2 &lt; 0.1.7。
+        /// 【历史 bug】旧实现只取预发布段末尾数字、忽略 alpha/rc 标签，导致 0.1.7-alpha.2 与 0.1.7-rc.2 判为相等
+        /// （rc.1 更被判为更旧），于是明明有新版却提示“已是最新版本”。
+        /// </summary>
         private static int CompareVersions(string a, string b)
         {
-            // 拆出主次补丁数字段
-            var ra = Regex.Match(a ?? "", @"^(\d+)\.(\d+)\.(\d+)");
-            var rb = Regex.Match(b ?? "", @"^(\d+)\.(\d+)\.(\d+)");
+            if (string.Equals(a ?? "", b ?? "", StringComparison.OrdinalIgnoreCase)) return 0;
+            var ra = Regex.Match(a ?? "", @"^v?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.\-]+))?(?:\+[0-9A-Za-z.\-]+)?$");
+            var rb = Regex.Match(b ?? "", @"^v?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.\-]+))?(?:\+[0-9A-Za-z.\-]+)?$");
             if (!ra.Success || !rb.Success) return string.CompareOrdinal(a, b);
             for (int i = 1; i <= 3; i++)
             {
@@ -1945,20 +2059,33 @@ namespace DshLauncher
                 int nb = int.Parse(rb.Groups[i].Value);
                 if (na != nb) return na.CompareTo(nb);
             }
-            // 主次补丁相同，比较 prerelease；无 prerelease 的最新
-            int pa = GetPreReleaseNum(a);
-            int pb = GetPreReleaseNum(b);
-            return pa.CompareTo(pb);
+            string pa = ra.Groups[4].Success ? ra.Groups[4].Value : null;
+            string pb = rb.Groups[4].Success ? rb.Groups[4].Value : null;
+            if (pa == null && pb == null) return 0;
+            if (pa == null) return 1;    // a 无预发布段 → a 更新
+            if (pb == null) return -1;
+            return ComparePreRelease(pa, pb);
         }
 
-        /// <summary>取 prerelease 段里的数字（如 -rc.6 → 6）；无 prerelease 返回 int.MaxValue（视为最稳定/最新）。</summary>
-        private static int GetPreReleaseNum(string v)
+        /// <summary>比较两个预发布段（如 "alpha.2" vs "rc.1"）：数字段按数值、数字 &lt; 字母、字母按字典序，段数多者更新。</summary>
+        private static int ComparePreRelease(string a, string b)
         {
-            var pm = Regex.Match(v ?? "", @"-([^.\s]+)(?:\.(\d+))?");
-            if (!pm.Success) return int.MaxValue;
-            // 形如 rc.6 或 beta.3：取最后一段数字
-            var num = Regex.Match(pm.Groups[0].Value, @"(\d+)\s*$");
-            return num.Success ? int.Parse(num.Groups[1].Value) : 0;
+            var xs = a.Split('.');
+            var ys = b.Split('.');
+            int n = Math.Min(xs.Length, ys.Length);
+            for (int i = 0; i < n; i++)
+            {
+                string x = xs[i], y = ys[i];
+                bool xn = Regex.IsMatch(x, @"^\d+$");
+                bool yn = Regex.IsMatch(y, @"^\d+$");
+                int c;
+                if (xn && yn) c = long.Parse(x).CompareTo(long.Parse(y));
+                else if (xn) c = -1;                       // 数字标识符 < 字母标识符
+                else if (yn) c = 1;
+                else c = string.CompareOrdinal(x, y);      // alpha < beta < rc
+                if (c != 0) return c;
+            }
+            return xs.Length.CompareTo(ys.Length);
         }
 
         /// <summary>
